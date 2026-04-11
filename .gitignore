@@ -40,6 +40,7 @@ exiftool.exe          # 配布物はリポジトリから除外
 *.log
 .github/copilot-instructions.md
 SPEC.md
+test_garmin_login.py  # テスト用スクリプト（クレデンシャル含む可能性）
 
 # Nuitkaビルド成果物
 main.exe
