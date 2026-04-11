@@ -896,6 +896,7 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
     """
     ExifToolを引数ファイル(-@)経由で実行します。
     Windowsのコマンドライン長制限を回避するため、ファイルパスを一時ファイルに書き出して渡します。
+    ExifToolの終了コード1（軽微な警告）は正常扱いとし、2以上のみ例外を送出します。
     """
     argfile_path = None
     try:
@@ -906,10 +907,17 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
                 f.write(f'{path}\n')
             argfile_path = f.name
 
-        return subprocess.run(
+        result = subprocess.run(
             [exiftool_path, '-@', argfile_path],
-            check=True, capture_output=True, encoding='utf-8', errors='ignore'
+            capture_output=True, encoding='utf-8', errors='ignore'
         )
+        # ExifTool終了コード: 0=成功, 1=軽微な警告(正常扱い), 2=致命的エラー
+        if result.returncode >= 2:
+            raise subprocess.CalledProcessError(
+                result.returncode, [exiftool_path, '-@', argfile_path],
+                output=result.stdout, stderr=result.stderr
+            )
+        return result
     finally:
         if argfile_path:
             Path(argfile_path).unlink(missing_ok=True)
@@ -1548,19 +1556,23 @@ class ProcessingPopup(ctk.CTkToplevel):
         without_count = 0
         photo_dates = set()  # 撮影日を収集
         
-        # ExifToolでファイル情報を一括取得
-        command = [
-            exiftool_path,
-            "-json",
-            "-DateTimeOriginal",
-            "-GPSLatitude",
-            "-GPSLongitude",
-            "-FileName",
-            str(dest_dir),
+        # ExifToolでファイル情報を一括取得（-@引数ファイル経由）
+        target_files = [
+            path
+            for path in dest_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in file_extensions
         ]
         
+        if not target_files:
+            self.log_message("分類対象のファイルがありません", "WARNING")
+            return photo_dates
+        
         try:
-            result = subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+            result = _run_exiftool_argfile(
+                exiftool_path,
+                ['-json', '-DateTimeOriginal', '-GPSLatitude', '-GPSLongitude', '-FileName'],
+                target_files
+            )
             if not result.stdout or result.stdout.strip() == "":
                 self.log_message("ExifToolからデータを取得できませんでした", "WARNING")
                 return photo_dates
