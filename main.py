@@ -900,7 +900,9 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
     """
     argfile_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+        # utf-8-sig: BOM付きUTF-8で書き出す。ExifToolはBOM付きargfileをUTF-8として認識する
+        # （BOMなしの場合、Windowsではシステムコードページ=CP932で読まれ日本語パスが文字化けする）
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8-sig') as f:
             for arg in args:
                 f.write(f'{arg}\n')
             for path in files:
