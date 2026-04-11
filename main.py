@@ -2552,6 +2552,14 @@ class MainApp(ctk.CTk):
         # ラベルの幅を統一
         LABEL_WIDTH = 150
 
+        # 設定保存ボタンの案内
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="※ 設定を変更したら、ページ下部の「設定を保存」ボタンを押してください",
+            font=("Yu Gothic UI", 12),
+            text_color="#E8A030"
+        ).pack(pady=(10, 0))
+
         # === キャッシュディレクトリ設定 ===
         ctk.CTkLabel(
             scrollable_frame, 
