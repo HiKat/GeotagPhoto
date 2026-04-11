@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 仮想環境
+venv/
+myenv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# プロジェクト固有
+config.json           # 個人設定を含むため除外（重要）
+exiftool.exe          # 配布物はリポジトリから除外
+*.log
+.github/copilot-instructions.md
+SPEC.md
+
+# Nuitkaビルド成果物
+main.exe
+main.build/
+main.dist/
+main.onefile-build/
+
+# キャッシュディレクトリ（ユーザー環境依存）
+.geotagphoto_cache/
+garmin_tokens/
+
+# テスト用データ
+test_data/
+tmp/
+
+# 旧リポジトリバックアップ
+.git_backup/

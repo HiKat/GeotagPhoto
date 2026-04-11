@@ -1,0 +1,32 @@
+Component: ExifTool
+Version: 12.x (bundled version may vary)
+Upstream: https://exiftool.org/
+Repository: https://github.com/exiftool/exiftool
+Author: Phil Harvey
+License: Dual license — choose either one:
+
+  1. GNU General Public License (GPL), version 1 or later
+  2. Artistic License
+
+------------------------------------------------------------------------
+
+ExifTool is free software distributed under the same licensing terms as
+Perl itself. This means you may redistribute and/or modify it under the
+terms of either:
+
+  (a) the GNU General Public License as published by the Free Software
+      Foundation; either version 1, or (at your option) any later version, or
+
+  (b) the "Artistic License" which comes with Perl.
+
+For the full text of the GNU General Public License, see the COPYING file
+at the root of this repository, or visit:
+  https://www.gnu.org/licenses/gpl-3.0.txt
+
+For the full text of the Artistic License, see:
+  https://dev.perl.org/licenses/artistic.html
+
+------------------------------------------------------------------------
+
+Note: When distributing ExifTool (exiftool.exe) as part of a release
+package, this license notice must be included.

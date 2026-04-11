@@ -1,0 +1,16 @@
+# GeotagPhoto の依存パッケージ
+# Python 3.10以上が必要です
+
+# GUI関連
+customtkinter==5.2.2
+tkcalendar==1.6.1
+tkintermapview==1.29
+
+# 画像処理
+Pillow==12.2.0
+
+# タイムゾーンデータベース（Windows用）
+tzdata==2026.1
+
+# Garmin Connect API
+garminconnect==0.3.1

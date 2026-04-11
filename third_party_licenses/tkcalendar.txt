@@ -1,0 +1,9 @@
+Component: tkcalendar
+Version: 1.6.1
+Upstream: https://pypi.org/project/tkcalendar/
+Repository: https://github.com/j4321/tkcalendar
+License: GNU General Public License v3 (GPLv3)
+Author: Juliette Monsel
+
+The full GPLv3 license text is provided in the COPYING file at the root of
+this repository.
