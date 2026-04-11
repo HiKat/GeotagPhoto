@@ -59,6 +59,7 @@ garmin_tokens/
 # テスト用データ
 test_data/
 tmp/
+test/
 
 # 旧リポジトリバックアップ
 .git_backup/
