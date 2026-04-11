@@ -638,7 +638,7 @@ def _garmin_login_with_retry(
 
             # Garmin SSO の Cloudflare がデフォルトの python-requests User-Agent を
             # ボットと判定して 429 を返すため、ブラウザの User-Agent を設定します。
-            api.garth.sess.headers.update({
+            api.client.cs.headers.update({
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -663,7 +663,7 @@ def _garmin_login_with_retry(
 
             # ログイン成功後、トークンをキャッシュに保存します。
             try:
-                api.garth.dump(tokenstore_path)
+                api.client.dump(tokenstore_path)
             except Exception:
                 pass
 
