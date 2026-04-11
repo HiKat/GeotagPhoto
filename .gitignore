@@ -48,9 +48,15 @@ test_garmin_diag.py
 
 # Nuitkaビルド成果物
 main.exe
+GeotagPhoto.exe
 main.build/
 main.dist/
 main.onefile-build/
+
+# 配布パッケージ（一時ステージング・ZIPアーカイブ）
+dist_package/
+*.zip
+release_notes.md
 
 # キャッシュディレクトリ（ユーザー環境依存）
 .geotagphoto_cache/
@@ -59,7 +65,6 @@ garmin_tokens/
 # テスト用データ
 test_data/
 tmp/
-test/
 
 # 旧リポジトリバックアップ
 .git_backup/
