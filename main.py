@@ -18,11 +18,13 @@
 import base64
 import io
 import json
+import logging
 import os
 import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -610,9 +612,33 @@ def _get_garmin_tokenstore_dir() -> Path:
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
-    """429レート制限エラーかどうかを判定します。"""
-    error_str = str(error)
-    return "429" in error_str or "Too Many Requests" in error_str
+    """429レート制限エラーかどうかを判定します。例外チェーン全体を確認します。"""
+    if isinstance(error, GarminConnectTooManyRequestsError):
+        return True
+    # 例外メッセージとチェーン先を両方チェック
+    err = error
+    while err is not None:
+        error_str = str(err)
+        if "429" in error_str or "Too Many Requests" in error_str:
+            return True
+        if isinstance(err, GarminConnectTooManyRequestsError):
+            return True
+        err = getattr(err, "__cause__", None)
+    return False
+
+
+class _GarminLogHandler(logging.Handler):
+    """garminconnectライブラリのログをコールバックに転送するハンドラです。"""
+    def __init__(self, callback: Callable[[str], None]):
+        super().__init__()
+        self.callback = callback
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.callback(f"  [{record.levelname}] {msg}")
+        except Exception:
+            pass
 
 
 def _garmin_login_with_retry(
@@ -621,72 +647,92 @@ def _garmin_login_with_retry(
     tokenstore_dir: Path,
     tokenstore_path: str,
     log_callback: Optional[Callable[[str], None]] = None,
-    max_retries: int = 5,
+    max_retries: int = 1,
 ) -> tuple:
     """
-    Garmin Connectにログインします。429エラー時は指数バックオフでリトライします。
+    Garmin Connectにログインします。
+
+    garminconnect ライブラリ v0.3.1 は内部で最大8以上のPOSTリクエストを
+    送信するため（portal×5impersonation + portal+requests + mobile×2）、
+    外側でのリトライは原則1回のみとします。
+    429エラーはGarminバックエンドのIPレベル制限（24時間以上持続する場合あり）
+    であり、短時間の待機後にリトライしても解決しません。
 
     Returns:
         tuple: (Garmin APIインスタンス, ログイン方法の文字列)
     """
-    token_file = tokenstore_dir / "oauth1_token.json"
+    # garminconnect ライブラリのログをUIに転送
+    garmin_logger = logging.getLogger("garminconnect.client")
+    log_handler = None
+    if log_callback:
+        log_handler = _GarminLogHandler(log_callback)
+        log_handler.setLevel(logging.WARNING)
+        garmin_logger.addHandler(log_handler)
+        garmin_logger.setLevel(logging.DEBUG)
+
+    # garminconnect ライブラリは garmin_tokens.json に保存します
+    token_file = tokenstore_dir / "garmin_tokens.json"
     last_error = None
 
-    for attempt in range(max_retries):
-        try:
-            api = Garmin(email, password)
+    try:
+        for attempt in range(max_retries):
+            try:
+                api = Garmin(email, password)
 
-            # Garmin SSO の Cloudflare がデフォルトの python-requests User-Agent を
-            # ボットと判定して 429 を返すため、ブラウザの User-Agent を設定します。
-            api.client.cs.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-            })
-
-            login_method = "クレデンシャル"
-
-            if token_file.exists():
-                try:
+                if token_file.exists():
+                    if log_callback:
+                        log_callback("トークンキャッシュからログインを試行します...")
                     api.login(tokenstore=tokenstore_path)
                     login_method = "トークンキャッシュ"
-                except Exception as token_err:
-                    if _is_rate_limit_error(token_err):
-                        raise  # 429はリトライループで処理
-                    # トークン無効時はクレデンシャルで再ログイン
-                    api = Garmin(email, password)
+                else:
+                    if log_callback:
+                        log_callback("クレデンシャルでログインを試行します...")
                     api.login()
-            else:
-                api.login()
+                    login_method = "クレデンシャル"
 
-            # ログイン成功後、トークンをキャッシュに保存します。
-            try:
-                api.client.dump(tokenstore_path)
-            except Exception:
-                pass
+                # ログイン成功後、トークンをキャッシュに保存します。
+                try:
+                    api.client.dump(tokenstore_path)
+                except Exception:
+                    pass
 
-            return api, login_method
+                return api, login_method
 
-        except Exception as e:
-            last_error = e
-            if not _is_rate_limit_error(e):
-                raise  # 429以外のエラーはそのまま投げる
+            except GarminConnectAuthenticationError as e:
+                if not _is_rate_limit_error(e):
+                    raise  # パスワード不一致等は即座にエラー
+                last_error = e
 
-            if attempt < max_retries - 1:
-                # 指数バックオフ: 30s, 60s, 120s, 240s
-                wait_seconds = 30 * (2 ** attempt)
-                if log_callback:
-                    log_callback(
-                        f"⚠ レート制限を検出しました。"
-                        f"{wait_seconds}秒後にリトライします..."
-                        f"（{attempt + 1}/{max_retries}）"
-                    )
-                time.sleep(wait_seconds)
+            except Exception as e:
+                if not _is_rate_limit_error(e):
+                    raise  # 429以外のエラーはそのまま投げる
+                last_error = e
 
-    # 全リトライ失敗
-    raise last_error
+            # --- 429系エラーのハンドリング ---
+            # 429はGarminバックエンドのIPレベル制限です。
+            # トークンの問題ではないため、キャッシュは削除しません。
+            # 短時間のリトライは無意味（制限は数時間〜24時間以上持続）なので、
+            # ユーザーに状況を通知して終了します。
+            if log_callback:
+                log_callback(
+                    "⚠ Garminサーバーからレート制限（429）を受けました。"
+                )
+                log_callback(
+                    "  これはIPアドレスベースの制限で、"
+                    "解除まで数時間〜24時間かかる場合があります。"
+                )
+                log_callback(
+                    "  しばらく時間をおいてから再試行するか、"
+                    "別のネットワーク（モバイル回線等）からお試しください。"
+                )
+
+        # 全リトライ失敗
+        raise last_error
+
+    finally:
+        # ログハンドラをクリーンアップ
+        if log_handler:
+            garmin_logger.removeHandler(log_handler)
 
 
 def download_garmin_activities_gpx(
@@ -775,34 +821,44 @@ def download_garmin_activities_gpx(
 
     except GarminConnectTooManyRequestsError as error:
         if log_callback:
-            log_callback("⚠ Garminサーバーへのリクエスト回数が制限を超えました（レート制限）。")
-            log_callback("  10〜15分ほど時間をおいてから再試行してください。")
+            log_callback("⚠ Garminサーバーからレート制限（429）を受けました。")
+            log_callback("  IPアドレスベースの制限のため、解除まで数時間〜24時間かかる場合があります。")
+            log_callback("  しばらく時間をおくか、別のネットワークから再試行してください。")
         raise
-    except (
-        GarminConnectConnectionError,
-        GarminConnectAuthenticationError,
-    ) as error:
-        # 認証エラー時はキャッシュ済みトークンを削除します。
-        try:
-            for token_file in tokenstore_dir.glob("*.json"):
-                token_file.unlink()
-        except Exception:
-            pass
-        error_str = str(error)
-        if "429" in error_str or "Too Many Requests" in error_str:
+    except GarminConnectAuthenticationError as error:
+        if _is_rate_limit_error(error):
+            # 429が認証エラーとしてラップされた場合はトークンを削除しない
             if log_callback:
-                log_callback("⚠ Garminサーバーへのリクエスト回数が制限を超えました（レート制限）。")
-                log_callback("  10〜15分ほど時間をおいてから再試行してください。")
+                log_callback("⚠ Garminサーバーからレート制限（429）を受けました。")
+                log_callback("  IPアドレスベースの制限のため、解除まで数時間〜24時間かかる場合があります。")
+                log_callback("  しばらく時間をおくか、別のネットワークから再試行してください。")
+        else:
+            # パスワード不一致等の認証エラー時のみトークンを削除
+            try:
+                for token_file in tokenstore_dir.glob("*.json"):
+                    token_file.unlink()
+            except Exception:
+                pass
+            if log_callback:
+                log_callback(f"認証エラー: {error}")
+        raise
+    except GarminConnectConnectionError as error:
+        # 接続エラー（429ラップ含む）の場合はトークンを削除しない
+        if _is_rate_limit_error(error):
+            if log_callback:
+                log_callback("⚠ Garminサーバーからレート制限（429）を受けました。")
+                log_callback("  IPアドレスベースの制限のため、解除まで数時間〜24時間かかる場合があります。")
+                log_callback("  しばらく時間をおくか、別のネットワークから再試行してください。")
         else:
             if log_callback:
                 log_callback(f"Garmin接続エラー: {error}")
         raise
     except Exception as error:
-        error_str = str(error)
-        if "429" in error_str or "Too Many Requests" in error_str:
+        if _is_rate_limit_error(error):
             if log_callback:
-                log_callback("⚠ Garminサーバーへのリクエスト回数が制限を超えました（レート制限）。")
-                log_callback("  10〜15分ほど時間をおいてから再試行してください。")
+                log_callback("⚠ Garminサーバーからレート制限（429）を受けました。")
+                log_callback("  IPアドレスベースの制限のため、解除まで数時間〜24時間かかる場合があります。")
+                log_callback("  しばらく時間をおくか、別のネットワークから再試行してください。")
         else:
             if log_callback:
                 log_callback(f"予期せぬエラー: {error}")
@@ -836,6 +892,39 @@ class GeotagLogEntry:
         return "付与なし"
 
 
+def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]) -> subprocess.CompletedProcess:
+    """
+    ExifToolを引数ファイル(-@)経由で実行します。
+    Windowsのコマンドライン長制限を回避するため、ファイルパスを一時ファイルに書き出して渡します。
+    ExifToolの終了コード1（軽微な警告）は正常扱いとし、2以上のみ例外を送出します。
+    """
+    argfile_path = None
+    try:
+        # utf-8-sig: BOM付きUTF-8で書き出す。ExifToolはBOM付きargfileをUTF-8として認識する
+        # （BOMなしの場合、Windowsではシステムコードページ=CP932で読まれ日本語パスが文字化けする）
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8-sig') as f:
+            for arg in args:
+                f.write(f'{arg}\n')
+            for path in files:
+                f.write(f'{path}\n')
+            argfile_path = f.name
+
+        result = subprocess.run(
+            [exiftool_path, '-@', argfile_path],
+            capture_output=True, encoding='utf-8', errors='ignore'
+        )
+        # ExifTool終了コード: 0=成功, 1=軽微な警告(正常扱い), 2=致命的エラー
+        if result.returncode >= 2:
+            raise subprocess.CalledProcessError(
+                result.returncode, [exiftool_path, '-@', argfile_path],
+                output=result.stdout, stderr=result.stderr
+            )
+        return result
+    finally:
+        if argfile_path:
+            Path(argfile_path).unlink(missing_ok=True)
+
+
 def filter_files_without_gps(exiftool_path: str, files: List[Path]) -> tuple[List[Path], List[Path]]:
     """
     ファイルをGPS情報の有無で分類します。
@@ -846,17 +935,13 @@ def filter_files_without_gps(exiftool_path: str, files: List[Path]) -> tuple[Lis
     if not files:
         return [], []
     
-    # ExifToolでGPS情報を確認
-    command = [
-        exiftool_path,
-        "-json",
-        "-GPSLatitude",
-        "-GPSLongitude",
-        "-FileName",
-    ] + [str(path) for path in files]
-    
+    # ExifToolでGPS情報を確認（-@引数ファイル経由）
     try:
-        result = subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+        result = _run_exiftool_argfile(
+            exiftool_path,
+            ['-json', '-GPSLatitude', '-GPSLongitude', '-FileName'],
+            files
+        )
         if not result.stdout or result.stdout.strip() == "":
             return files, []  # 情報が取得できない場合は全てGPS情報なしとして扱う
         
@@ -933,16 +1018,12 @@ def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file
     # ワーカー数が1の場合、または処理対象ファイルが少ない場合は並列化しない
     if max_workers <= 1 or len(files_to_process) <= 10:
         # 通常の処理（並列化なし）
-        command = [
+        # -@引数ファイル経由で実行（Windowsコマンドライン長制限回避）
+        _run_exiftool_argfile(
             exiftool_path,
-            "-overwrite_original",
-            "-geotag",
-            str(gpx_file),
-        ] + [str(path) for path in files_to_process]
-        
-        # コマンドを実行し、エラーがあれば例外を発生させます。
-        # encodingをutf-8に指定してUnicodeエラーを防止
-        subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+            ['-overwrite_original', '-geotag', str(gpx_file)],
+            files_to_process
+        )
         
         return len(files_to_process), skipped_count
     
@@ -959,17 +1040,18 @@ def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file
             int: 処理したファイル数
         """
         try:
-            command = [
+            _run_exiftool_argfile(
                 exiftool_path,
-                "-overwrite_original",
-                "-geotag",
-                str(gpx_file),
-            ] + [str(path) for path in batch_files]
-            
-            subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+                ['-overwrite_original', '-geotag', str(gpx_file)],
+                batch_files
+            )
             return len(batch_files)
+        except subprocess.CalledProcessError as e:
+            # exiftoolのエラー出力を表示（コマンド全体ではなく原因を表示）
+            stderr_msg = e.stderr.strip() if e.stderr else f"exit code {e.returncode}"
+            print(f"⚠ バッチ処理でエラー: {stderr_msg}")
+            return 0
         except Exception as e:
-            # エラーが発生した場合も続行（部分的な成功を許容）
             print(f"⚠ バッチ処理でエラー: {e}")
             return 0
     
@@ -999,18 +1081,13 @@ def collect_exif_log(exiftool_path: str, dest_dir: Path, file_extensions: set) -
     if not files_to_process:
         return []
     
-    command = [
-        exiftool_path,
-        "-json",
-        "-DateTimeOriginal",
-        "-GPSLatitude",
-        "-GPSLongitude",
-        "-FileName",
-    ] + [str(path) for path in files_to_process]
-
     # ExifToolの結果をJSON文字列として取得します。
-    # encodingをutf-8に指定してUnicodeエラーを防止
-    result = subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+    # -@引数ファイル経由で実行（Windowsコマンドライン長制限回避）
+    result = _run_exiftool_argfile(
+        exiftool_path,
+        ['-json', '-DateTimeOriginal', '-GPSLatitude', '-GPSLongitude', '-FileName'],
+        files_to_process
+    )
     
     # stdoutが空の場合のハンドリング
     if not result.stdout or result.stdout.strip() == "":
@@ -1481,19 +1558,23 @@ class ProcessingPopup(ctk.CTkToplevel):
         without_count = 0
         photo_dates = set()  # 撮影日を収集
         
-        # ExifToolでファイル情報を一括取得
-        command = [
-            exiftool_path,
-            "-json",
-            "-DateTimeOriginal",
-            "-GPSLatitude",
-            "-GPSLongitude",
-            "-FileName",
-            str(dest_dir),
+        # ExifToolでファイル情報を一括取得（-@引数ファイル経由）
+        target_files = [
+            path
+            for path in dest_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in file_extensions
         ]
         
+        if not target_files:
+            self.log_message("分類対象のファイルがありません", "WARNING")
+            return photo_dates
+        
         try:
-            result = subprocess.run(command, check=True, capture_output=True, encoding='utf-8', errors='ignore')
+            result = _run_exiftool_argfile(
+                exiftool_path,
+                ['-json', '-DateTimeOriginal', '-GPSLatitude', '-GPSLongitude', '-FileName'],
+                target_files
+            )
             if not result.stdout or result.stdout.strip() == "":
                 self.log_message("ExifToolからデータを取得できませんでした", "WARNING")
                 return photo_dates
