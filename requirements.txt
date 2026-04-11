@@ -13,4 +13,4 @@ Pillow==12.2.0
 tzdata==2026.1
 
 # Garmin Connect API
-garminconnect==0.3.1
+garminconnect>=0.3.2

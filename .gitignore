@@ -35,12 +35,16 @@ env/
 *~
 
 # プロジェクト固有
-config.json           # 個人設定を含むため除外（重要）
-exiftool.exe          # 配布物はリポジトリから除外
+# 個人設定を含むため除外（重要）
+config.json
+# 配布物はリポジトリから除外
+exiftool.exe
 *.log
 .github/copilot-instructions.md
 SPEC.md
-test_garmin_login.py  # テスト用スクリプト（クレデンシャル含む可能性）
+# テスト用スクリプト（クレデンシャル含む可能性）
+test_garmin_login.py
+test_garmin_diag.py
 
 # Nuitkaビルド成果物
 main.exe
