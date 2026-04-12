@@ -2,6 +2,8 @@
 
 Garmin Connectから取得したGPX/TCXを使って、画像にジオタグを付与するWindows向けGUIアプリです。
 
+![GeotagPhoto デモ画面](static/demo/20260412_GeotagPhoto_demo1.png)
+
 ---
 
 ## 前提条件: ExifToolのインストール（必須）
