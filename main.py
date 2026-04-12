@@ -568,8 +568,12 @@ class SettingsManager:
         settings.update(data)
         new_cache_dir = settings.get("cache_dir")
 
+        # 実効パスで比較（未設定時はデフォルトディレクトリを使用）
+        effective_old = str(Path(old_cache_dir).resolve()) if old_cache_dir else str(cls._get_default_dir().resolve())
+        effective_new = str(Path(new_cache_dir).resolve()) if new_cache_dir else str(cls._get_default_dir().resolve())
+
         # cache_dir が変更された場合、新しい場所に保存
-        if new_cache_dir and new_cache_dir != old_cache_dir:
+        if new_cache_dir and effective_new != effective_old:
             new_dir = Path(new_cache_dir)
             new_dir.mkdir(parents=True, exist_ok=True)
             new_config_path = new_dir / cls.CONFIG_FILE
