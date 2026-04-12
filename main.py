@@ -3413,6 +3413,14 @@ class MainApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    # Windows DPI awareness を明示的に設定（Nuitka standalone での表示崩れ防止）
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
     # CustomTkinterのテーマ設定
     ctk.set_appearance_mode("System")
     ctk.set_default_color_theme("blue")
