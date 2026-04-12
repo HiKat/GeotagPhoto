@@ -1299,6 +1299,7 @@ class DownloadLogPopup(ctk.CTkToplevel):
         fmt_label = "GPX" if download_format == "gpx" else "TCX"
         try:
             self.update_log(f"ダウンロード開始...（形式: {fmt_label}）")
+            self.update_log("※ 二段階認証を設定している場合、認証コード入力のポップアップが表示されるまでしばらくお待ちください。")
             downloaded_files = download_garmin_activities_gpx(
                 target_dates,
                 gpx_dir,
