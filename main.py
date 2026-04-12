@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+import queue
 import random
 import shutil
 import subprocess
@@ -648,6 +649,7 @@ def _garmin_login_with_retry(
     tokenstore_path: str,
     log_callback: Optional[Callable[[str], None]] = None,
     max_retries: int = 1,
+    prompt_mfa: Optional[Callable[[], str]] = None,
 ) -> tuple:
     """
     Garmin Connectにログインします。
@@ -677,7 +679,7 @@ def _garmin_login_with_retry(
     try:
         for attempt in range(max_retries):
             try:
-                api = Garmin(email, password)
+                api = Garmin(email, password, prompt_mfa=prompt_mfa)
 
                 if token_file.exists():
                     if log_callback:
@@ -742,6 +744,7 @@ def download_garmin_activities_gpx(
     password: str,
     log_callback: Optional[Callable[[str], None]] = None,
     download_format: str = "gpx",
+    prompt_mfa: Optional[Callable[[], str]] = None,
 ) -> List[Path]:
     """
     指定された日付のGarminアクティビティを取得し、GPXまたはTCXを保存します。
@@ -766,7 +769,8 @@ def download_garmin_activities_gpx(
         # Garmin ConnectのAPIクライアントを初期化し、ログインします。
         # 429エラー時は指数バックオフでリトライします。
         api, login_method = _garmin_login_with_retry(
-            email, password, tokenstore_dir, tokenstore_path, log_callback
+            email, password, tokenstore_dir, tokenstore_path, log_callback,
+            prompt_mfa=prompt_mfa,
         )
 
         if log_callback:
@@ -1136,6 +1140,57 @@ def collect_exif_log(exiftool_path: str, dest_dir: Path, file_extensions: set) -
 # -----------------------------
 
 
+class MFAInputDialog(ctk.CTkToplevel):
+    """
+    ポップアップ: Garmin二段階認証（MFA）のワンタイムコード入力画面です。
+    """
+
+    def __init__(self, master: ctk.CTkBaseClass):
+        super().__init__(master)
+        self.title("二段階認証")
+        self.geometry("400x200")
+        self.transient(master)
+        self.resizable(False, False)
+
+        self.mfa_code: Optional[str] = None
+
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self,
+            text="Garminアカウントの二段階認証コードを入力してください。",
+            font=("Yu Gothic UI", 13),
+            wraplength=360,
+        ).pack(pady=(20, 10))
+
+        self.code_entry = ctk.CTkEntry(
+            self, width=200, placeholder_text="認証コード",
+            font=("Yu Gothic UI", 14), justify="center",
+        )
+        self.code_entry.pack(pady=5)
+        self.code_entry.bind("<Return>", lambda _: self._on_submit())
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=15)
+        ctk.CTkButton(btn_frame, text="送信", width=100, command=self._on_submit).pack(side="left", padx=6)
+        ctk.CTkButton(btn_frame, text="キャンセル", width=100, command=self._on_cancel).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.code_entry.focus_force()
+
+    def _on_submit(self) -> None:
+        code = self.code_entry.get().strip()
+        if code:
+            self.mfa_code = code
+            self.grab_release()
+            self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.mfa_code = None
+        self.grab_release()
+        self.destroy()
+
+
 class DownloadLogPopup(ctk.CTkToplevel):
     """
     ポップアップ: ダウンロードのログを表示する画面です。
@@ -1150,6 +1205,9 @@ class DownloadLogPopup(ctk.CTkToplevel):
         self.start_date = start_date
         self.end_date = end_date or start_date
         self.selected_dates = selected_dates  # スキャンで取得した日付リスト
+
+        # MFA用のスレッド間通信キュー
+        self._mfa_queue: queue.Queue[Optional[str]] = queue.Queue()
 
         # 下のウィンドウの操作をロックします。
         self.grab_set()
@@ -1209,6 +1267,25 @@ class DownloadLogPopup(ctk.CTkToplevel):
         # ダウンロード処理を実行します。
         self.download_worker(target_dates, Path(gpx_dir), email, password, download_format)
 
+    def _prompt_mfa_threadsafe(self) -> str:
+        """
+        バックグラウンドスレッドから呼び出されるMFAコールバックです。
+        メインスレッドにダイアログ表示を依頼し、入力結果を待機して返します。
+        """
+        self.update_log("🔐 二段階認証が要求されました。コードを入力してください...")
+
+        def _show_mfa_dialog() -> None:
+            dialog = MFAInputDialog(self)
+            dialog.wait_window()
+            self._mfa_queue.put(dialog.mfa_code)
+
+        self.after(0, _show_mfa_dialog)
+        # バックグラウンドスレッドをブロックしてユーザ入力を待機
+        code = self._mfa_queue.get()
+        if code is None:
+            raise GarminConnectAuthenticationError("MFA認証がキャンセルされました。")
+        return code
+
     def download_worker(
         self, target_dates: List[date], gpx_dir: Path, email: str, password: str,
         download_format: str = "gpx"
@@ -1229,6 +1306,7 @@ class DownloadLogPopup(ctk.CTkToplevel):
                 password,
                 log_callback=update_log_callback,
                 download_format=download_format,
+                prompt_mfa=self._prompt_mfa_threadsafe,
             )
             # ダウンロードされたファイルをMainAppに保存
             if isinstance(self.master, MainApp):
