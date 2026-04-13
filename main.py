@@ -778,7 +778,7 @@ def download_garmin_activities_gpx(
         )
 
         if log_callback:
-            log_callback(f"'{email}' でログインに成功しました。（{login_method}）")
+            log_callback(f"'abcd-1234@gmail.com' でログインに成功しました。（{login_method}）")
 
         for target_date in target_dates:
             if log_callback:
