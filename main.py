@@ -997,6 +997,44 @@ def filter_files_without_gps(exiftool_path: str, files: List[Path]) -> tuple[Lis
         return files, []
 
 
+def _classify_files_by_offset_time(exiftool_path: str, files: List[Path]) -> tuple[List[Path], List[Path]]:
+    """
+    ファイルをOffsetTimeOriginalタグの有無で分類します。
+
+    Returns:
+        tuple: (OffsetTimeOriginalがあるファイル, ないファイル)
+    """
+    if not files:
+        return [], []
+
+    try:
+        result = _run_exiftool_argfile(
+            exiftool_path,
+            ['-json', '-OffsetTimeOriginal', '-FileName'],
+            files
+        )
+        if not result.stdout or result.stdout.strip() == "":
+            return [], files
+
+        data = json.loads(result.stdout)
+        has_offset_info = {}
+        for item in data:
+            filename = item.get("FileName", "")
+            offset = item.get("OffsetTimeOriginal")
+            has_offset_info[filename] = (offset is not None and offset != "")
+
+        with_offset = []
+        without_offset = []
+        for file_path in files:
+            if has_offset_info.get(file_path.name, False):
+                with_offset.append(file_path)
+            else:
+                without_offset.append(file_path)
+        return with_offset, without_offset
+    except Exception:
+        return [], files
+
+
 def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Path, file_extensions: set, overwrite_existing: bool = False, max_workers: int = 4, camera_tz_offset: str = "") -> tuple[int, int]:
     """
     ExifToolでGPX/TCXを使ってジオタギングを行います。
@@ -1010,6 +1048,8 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
         overwrite_existing: 既にGPS情報があるファイルも上書きするかどうか（デフォルト: False）
         max_workers: 並列実行するワーカー数（デフォルト: 4）
         camera_tz_offset: カメラのタイムゾーンオフセット（例: "+09:00"）。
+            OffsetTimeOriginalタグがない写真に対するフォールバックとして使用。
+            OffsetTimeOriginalがある写真はEXIF内のオフセットが優先される。
             空文字の場合はExifToolのデフォルト動作（システムタイムゾーン）を使用。
     
     Returns:
@@ -1041,63 +1081,53 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
         # 処理対象がない場合は何もしない
         return 0, skipped_count
     
-    # ExifTool引数を構築: 複数GPXファイルを全て指定
-    geotag_args = ['-overwrite_original']
+    # ExifTool基本引数を構築: 複数GPXファイルを全て指定
+    base_geotag_args = ['-overwrite_original']
     for gpx in gpx_files:
-        geotag_args.extend(['-geotag', str(gpx)])
-    # カメラタイムゾーンが指定されている場合、ExifToolに明示的に伝える
-    # （OffsetTimeOriginalが無いカメラ(Leicaなど)でも正しくUTC変換される）
+        base_geotag_args.extend(['-geotag', str(gpx)])
+    
+    # OffsetTimeOriginalの有無でファイルを2グループに分類
+    # - OffsetTimeOriginalがある写真: ExifToolのデフォルト動作（EXIF内のオフセットを使用）
+    # - OffsetTimeOriginalがない写真: 設定のカメラタイムゾーンをフォールバックとして使用
+    files_with_offset, files_without_offset = _classify_files_by_offset_time(exiftool_path, files_to_process)
+    
+    geotag_args_default = list(base_geotag_args)  # OffsetTimeOriginalあり用（デフォルト動作）
+    geotag_args_fallback = list(base_geotag_args)  # OffsetTimeOriginalなし用（TZ指定付き）
     if camera_tz_offset:
-        geotag_args.append(f'-geotime<${{DateTimeOriginal}}{camera_tz_offset}')
+        geotag_args_fallback.append(f'-geotime<${{DateTimeOriginal}}{camera_tz_offset}')
     
-    # ファイルをバッチに分割して並列処理
-    # ワーカー数が1の場合、または処理対象ファイルが少ない場合は並列化しない
-    if max_workers <= 1 or len(files_to_process) <= 10:
-        # 通常の処理（並列化なし）
-        # -@引数ファイル経由で実行（Windowsコマンドライン長制限回避）
-        _run_exiftool_argfile(
-            exiftool_path,
-            geotag_args,
-            files_to_process
-        )
-        
-        return len(files_to_process), skipped_count
-    
-    # 並列処理: ファイルをバッチに分割
-    # 各バッチには適度な数のファイルを割り当て（最小5ファイル/バッチ）
-    batch_size = max(5, len(files_to_process) // max_workers)
-    batches = [files_to_process[i:i + batch_size] for i in range(0, len(files_to_process), batch_size)]
-    
-    def process_batch(batch_files: List[Path]) -> int:
-        """
-        ファイルのバッチに対してexiftoolを実行します。
-        
-        Returns:
-            int: 処理したファイル数
-        """
-        try:
-            _run_exiftool_argfile(
-                exiftool_path,
-                geotag_args,
-                batch_files
-            )
-            return len(batch_files)
-        except subprocess.CalledProcessError as e:
-            # exiftoolのエラー出力を表示（コマンド全体ではなく原因を表示）
-            stderr_msg = e.stderr.strip() if e.stderr else f"exit code {e.returncode}"
-            print(f"⚠ バッチ処理でエラー: {stderr_msg}")
+    def _run_geotag_group(files: List[Path], geotag_args: list) -> int:
+        """指定されたファイル群にジオタグを付与し、処理数を返す"""
+        if not files:
             return 0
-        except Exception as e:
-            print(f"⚠ バッチ処理でエラー: {e}")
-            return 0
+        
+        if max_workers <= 1 or len(files) <= 10:
+            _run_exiftool_argfile(exiftool_path, geotag_args, files)
+            return len(files)
+        
+        batch_size = max(5, len(files) // max_workers)
+        batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
+        
+        def process_batch(batch_files: List[Path]) -> int:
+            try:
+                _run_exiftool_argfile(exiftool_path, geotag_args, batch_files)
+                return len(batch_files)
+            except subprocess.CalledProcessError as e:
+                stderr_msg = e.stderr.strip() if e.stderr else f"exit code {e.returncode}"
+                print(f"⚠ バッチ処理でエラー: {stderr_msg}")
+                return 0
+            except Exception as e:
+                print(f"⚠ バッチ処理でエラー: {e}")
+                return 0
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return sum(executor.map(process_batch, batches))
     
-    # ThreadPoolExecutorで並列実行
-    # ProcessPoolExecutorではなくThreadPoolExecutorを使用（I/O待ちが多いため）
     processed_count = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 各バッチを並列実行
-        results = executor.map(process_batch, batches)
-        processed_count = sum(results)
+    # グループ1: OffsetTimeOriginalがある写真（ExifToolのデフォルト動作）
+    processed_count += _run_geotag_group(files_with_offset, geotag_args_default)
+    # グループ2: OffsetTimeOriginalがない写真（カメラTZ設定をフォールバック）
+    processed_count += _run_geotag_group(files_without_offset, geotag_args_fallback)
     
     return processed_count, skipped_count
 
@@ -3043,7 +3073,7 @@ class MainApp(ctk.CTk):
         
         ctk.CTkLabel(
             scrollable_frame,
-            text="カメラに設定されているタイムゾーンを指定します。写真のEXIF日時にタイムゾーン情報が含まれない場合、ここで設定したタイムゾーンで処理されます",
+            text="カメラに設定されているタイムゾーンを指定します。写真のEXIFにタイムゾーン情報（OffsetTimeOriginal）が含まれる場合はそちらが優先され、含まれない場合にここで設定したタイムゾーンがフォールバックとして使用されます",
             font=("Yu Gothic UI", 12),
             text_color="gray",
             wraplength=700,
