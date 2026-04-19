@@ -98,6 +98,23 @@ def find_exiftool() -> str:
     return "exiftool"
 
 
+def _tz_name_to_offset(tz_name: str) -> str:
+    """
+    IANAタイムゾーン名（例: "Asia/Tokyo"）を
+    UTCオフセット文字列（例: "+09:00"）に変換します。
+    """
+    try:
+        tz = ZoneInfo(tz_name)
+        offset = datetime.now(tz).utcoffset()
+        total_seconds = int(offset.total_seconds())
+        sign = '+' if total_seconds >= 0 else '-'
+        hours, remainder = divmod(abs(total_seconds), 3600)
+        minutes = remainder // 60
+        return f"{sign}{hours:02d}:{minutes:02d}"
+    except Exception:
+        return ""
+
+
 def list_gpx_or_tcx_files(gpx_dir: Path) -> List[Path]:
     """
     GPXまたはTCXファイルを指定フォルダから取得します。
@@ -980,18 +997,20 @@ def filter_files_without_gps(exiftool_path: str, files: List[Path]) -> tuple[Lis
         return files, []
 
 
-def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file_extensions: set, overwrite_existing: bool = False, max_workers: int = 4) -> tuple[int, int]:
+def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Path, file_extensions: set, overwrite_existing: bool = False, max_workers: int = 4, camera_tz_offset: str = "") -> tuple[int, int]:
     """
     ExifToolでGPX/TCXを使ってジオタギングを行います。
-    並列処理により複数のexiftoolプロセスを実行して高速化します。
+    複数のGPXファイルを同時に指定でき、並列処理で高速化します。
     
     Args:
         exiftool_path: ExifToolの実行ファイルパス
-        gpx_file: GPX/TCXファイルのパス
+        gpx_files: GPX/TCXファイルのパスのリスト
         dest_dir: 処理対象ディレクトリ
         file_extensions: 処理対象の拡張子セット
         overwrite_existing: 既にGPS情報があるファイルも上書きするかどうか（デフォルト: False）
         max_workers: 並列実行するワーカー数（デフォルト: 4）
+        camera_tz_offset: カメラのタイムゾーンオフセット（例: "+09:00"）。
+            空文字の場合はExifToolのデフォルト動作（システムタイムゾーン）を使用。
     
     Returns:
         tuple: (ジオタグを付与したファイル数, スキップしたファイル数)
@@ -1022,6 +1041,15 @@ def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file
         # 処理対象がない場合は何もしない
         return 0, skipped_count
     
+    # ExifTool引数を構築: 複数GPXファイルを全て指定
+    geotag_args = ['-overwrite_original']
+    for gpx in gpx_files:
+        geotag_args.extend(['-geotag', str(gpx)])
+    # カメラタイムゾーンが指定されている場合、ExifToolに明示的に伝える
+    # （OffsetTimeOriginalが無いカメラ(Leicaなど)でも正しくUTC変換される）
+    if camera_tz_offset:
+        geotag_args.append(f'-geotime<${{DateTimeOriginal}}{camera_tz_offset}')
+    
     # ファイルをバッチに分割して並列処理
     # ワーカー数が1の場合、または処理対象ファイルが少ない場合は並列化しない
     if max_workers <= 1 or len(files_to_process) <= 10:
@@ -1029,7 +1057,7 @@ def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file
         # -@引数ファイル経由で実行（Windowsコマンドライン長制限回避）
         _run_exiftool_argfile(
             exiftool_path,
-            ['-overwrite_original', '-geotag', str(gpx_file)],
+            geotag_args,
             files_to_process
         )
         
@@ -1050,7 +1078,7 @@ def run_exiftool_geotag(exiftool_path: str, gpx_file: Path, dest_dir: Path, file
         try:
             _run_exiftool_argfile(
                 exiftool_path,
-                ['-overwrite_original', '-geotag', str(gpx_file)],
+                geotag_args,
                 batch_files
             )
             return len(batch_files)
@@ -1503,8 +1531,7 @@ class ProcessingPopup(ctk.CTkToplevel):
                 self.after(0, lambda: self.close_button.configure(state="normal"))
                 return
 
-            gpx_file = gpx_files[0]
-            self.log_message(f"GPXファイルを使用: {gpx_file.name}")
+            self.log_message(f"{len(gpx_files)}件のGPXファイルを使用してジオタギングします")
 
             # 3. ExifToolでジオタギングします。
             exiftool_path = find_exiftool()
@@ -1516,7 +1543,10 @@ class ProcessingPopup(ctk.CTkToplevel):
                 overwrite_existing = settings.get("overwrite_existing_geotag", False)
                 # 設定から並列ワーカー数を取得（デフォルト: 4）
                 max_workers = int(settings.get("exiftool_max_workers", 4))
-                tagged_count, skipped_count = run_exiftool_geotag(exiftool_path, gpx_file, dest_dir, file_extensions, overwrite_existing, max_workers)
+                # カメラタイムゾーンからUTCオフセット文字列を生成
+                camera_tz_str = settings.get("camera_timezone", "Asia/Tokyo")
+                camera_tz_offset = _tz_name_to_offset(camera_tz_str)
+                tagged_count, skipped_count = run_exiftool_geotag(exiftool_path, gpx_files, dest_dir, file_extensions, overwrite_existing, max_workers, camera_tz_offset)
                 if skipped_count > 0:
                     self.log_message(f"ExifToolジオタギング完了: {tagged_count}個に付与、{skipped_count}個はスキップ（既にGPS情報あり）")
                 else:
