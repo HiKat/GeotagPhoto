@@ -1,6 +1,6 @@
 # GeotagPhoto
 
-Garmin Connectから取得したGPX/TCXを使って、画像にジオタグを付与するWindows向けGUIアプリです。
+Garmin Connectから取得したGPX/TCXを使って、画像にジオタグを付与するWindows向けGUIアプリです。  
 Automatically geotag your photos using Garmin Connect GPS logs.
 
 ![GeotagPhoto デモ画面](static/demo/20260412_GeotagPhoto_demo2.png)
