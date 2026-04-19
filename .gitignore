@@ -58,6 +58,12 @@ dist_package/
 *.zip
 release_notes.md
 
+# リリースビルド成果物
+releases/
+
+# Copilotスキル（ローカル開発用）
+.github/skills/
+
 # キャッシュディレクトリ（ユーザー環境依存）
 .geotagphoto_cache/
 garmin_tokens/
