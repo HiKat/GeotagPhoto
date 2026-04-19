@@ -936,7 +936,8 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
 
         result = subprocess.run(
             [exiftool_path, '-@', argfile_path],
-            capture_output=True, encoding='utf-8', errors='ignore'
+            capture_output=True, encoding='utf-8', errors='ignore',
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         # ExifTool終了コード: 0=成功, 1=軽微な警告(正常扱い), 2=致命的エラー
         if result.returncode >= 2:
@@ -2586,7 +2587,8 @@ class MainApp(ctk.CTk):
         for tag in ["-ThumbnailImage", "-PreviewImage"]:
             try:
                 command = [exiftool_path, "-b", tag, file_path]
-                result = subprocess.run(command, capture_output=True, check=False, timeout=5)
+                result = subprocess.run(command, capture_output=True, check=False, timeout=5,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
                 
                 if result.returncode == 0 and result.stdout:
                     # バイナリデータをPIL Imageに変換
