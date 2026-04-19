@@ -1973,7 +1973,7 @@ class MainApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("GM Photo Tagger")
+        self.title("GeotagPhoto")
         self.geometry("1500x900")
 
         # 設定読み込み
@@ -3355,7 +3355,7 @@ class MainApp(ctk.CTk):
         # ソフトウェアアイコン/タイトル
         ctk.CTkLabel(
             scrollable_frame,
-            text="📷 GM Photo Tagger",
+            text="📷 GeotagPhoto",
             font=("Yu Gothic UI", 28, "bold")
         ).pack(pady=(20, 10))
         
@@ -3369,7 +3369,7 @@ class MainApp(ctk.CTk):
         
         # 説明
         description = (
-            "GM Photo Taggerは、Garmin Connectなどからダウンロードした\n"
+            "GeotagPhotoは、Garmin Connectなどからダウンロードした\n"
             "GPXファイルを使用して、撮影した写真に位置情報を\n"
             "自動的に付与するアプリケーションです。\n\n"
             "主な機能:\n"
@@ -3525,7 +3525,7 @@ class MainApp(ctk.CTk):
         # フッター
         ctk.CTkLabel(
             scrollable_frame,
-            text="© 2026 さんだ～ / GM Photo Tagger",
+            text="© 2026 さんだ～ / GeotagPhoto",
             font=("Yu Gothic UI", 11),
             text_color="gray"
         ).pack(pady=(30, 20))
