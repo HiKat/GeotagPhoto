@@ -42,9 +42,8 @@ exiftool.exe
 *.log
 .github/copilot-instructions.md
 SPEC.md
-# テスト用スクリプト（クレデンシャル含む可能性）
-test_garmin_login.py
-test_garmin_diag.py
+# テスト配下は全て追跡対象外（クレデンシャル含む可能性あり）
+test/
 
 # Nuitkaビルド成果物
 main.exe
