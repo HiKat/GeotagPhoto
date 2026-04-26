@@ -15,11 +15,11 @@
 # You should have received a copy of the GNU General Public License
 # along with GeotagPhoto. If not, see <https://www.gnu.org/licenses/>.
 
-import base64
 import io
 import json
 import logging
 import os
+import pathlib as _pathlib_early
 import queue
 import random
 import shutil
@@ -28,7 +28,24 @@ import sys
 import tempfile
 import threading
 import time
+import traceback as _traceback_early
 import xml.etree.ElementTree as ET
+
+
+def _early_excepthook(exc_type, exc_value, exc_tb):
+    """起動時の未捕捉例外をログファイルに記録します（Nuitka診断用）。"""
+    try:
+        log = _pathlib_early.Path.home() / "GeotagPhoto_error.log"
+        log.write_text(
+            "".join(_traceback_early.format_exception(exc_type, exc_value, exc_tb)),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _early_excepthook
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -53,28 +70,6 @@ import tkintermapview
 # -----------------------------
 # ここからは共通ユーティリティ
 # -----------------------------
-
-
-def encode_password(raw_password: str) -> str:
-    """
-    パスワードを簡易的にエンコードするための関数です。
-    ※本格的な暗号化ではありませんが、
-    設定ファイルにそのまま平文で保存しないための最低限の対策です。
-    """
-    if not raw_password:
-        return ""
-    # base64でバイト列を文字列に変換して返します。
-    return base64.b64encode(raw_password.encode("utf-8")).decode("utf-8")
-
-
-def decode_password(encoded_password: str) -> str:
-    """
-    encode_passwordで保存した文字列を元に戻す関数です。
-    """
-    if not encoded_password:
-        return ""
-    # base64の文字列を元の文字列へ復元します。
-    return base64.b64decode(encoded_password.encode("utf-8")).decode("utf-8")
 
 
 def find_exiftool() -> str:
@@ -664,16 +659,18 @@ class _GarminLogHandler(logging.Handler):
 
 
 def _garmin_login_with_retry(
-    email: str,
-    password: str,
     tokenstore_dir: Path,
     tokenstore_path: str,
+    email: str = "",
+    password: str = "",
     log_callback: Optional[Callable[[str], None]] = None,
     max_retries: int = 1,
     prompt_mfa: Optional[Callable[[], str]] = None,
 ) -> tuple:
     """
     Garmin Connectにログインします。
+    トークンキャッシュが存在する場合はemail/password不要でログインを試みます。
+    トークンがない場合やトークンが無効な場合はemail/passwordが必要です。
 
     garminconnect ライブラリ v0.3.1 は内部で最大8以上のPOSTリクエストを
     送信するため（portal×5impersonation + portal+requests + mobile×2）、
@@ -700,18 +697,22 @@ def _garmin_login_with_retry(
     try:
         for attempt in range(max_retries):
             try:
-                api = Garmin(email, password, prompt_mfa=prompt_mfa)
+                api = Garmin(email or "", password or "", prompt_mfa=prompt_mfa)
 
                 if token_file.exists():
                     if log_callback:
                         log_callback("トークンキャッシュからログインを試行します...")
                     api.login(tokenstore=tokenstore_path)
                     login_method = "トークンキャッシュ"
-                else:
+                elif email and password:
                     if log_callback:
                         log_callback("クレデンシャルでログインを試行します...")
                     api.login()
                     login_method = "クレデンシャル"
+                else:
+                    raise GarminConnectAuthenticationError(
+                        "トークンキャッシュが存在しません。ログインが必要です。"
+                    )
 
                 # ログイン成功後、トークンをキャッシュに保存します。
                 try:
@@ -761,17 +762,18 @@ def _garmin_login_with_retry(
 def download_garmin_activities_gpx(
     target_dates: List[date],
     output_dir: Path,
-    email: str,
-    password: str,
     log_callback: Optional[Callable[[str], None]] = None,
     download_format: str = "gpx",
     prompt_mfa: Optional[Callable[[], str]] = None,
+    email: str = "",
+    password: str = "",
 ) -> List[Path]:
     """
     指定された日付のGarminアクティビティを取得し、GPXまたはTCXを保存します。
 
     log_callbackには画面表示用のログ出力関数を渡します。
     download_format: "gpx" または "tcx" を指定します（デフォルト: "gpx"）。
+    email/passwordはオプション。トークンキャッシュがある場合は不要です。
     
     セッショントークンをキャッシュし、毎回のログインを避けることで
     Garmin SSO の 429 Too Many Requests エラーを防止します。
@@ -790,12 +792,14 @@ def download_garmin_activities_gpx(
         # Garmin ConnectのAPIクライアントを初期化し、ログインします。
         # 429エラー時は指数バックオフでリトライします。
         api, login_method = _garmin_login_with_retry(
-            email, password, tokenstore_dir, tokenstore_path, log_callback,
+            tokenstore_dir, tokenstore_path,
+            email=email, password=password,
+            log_callback=log_callback,
             prompt_mfa=prompt_mfa,
         )
 
         if log_callback:
-            log_callback(f"'{email}' でログインに成功しました。（{login_method}）")
+            log_callback(f"ログインに成功しました。（{login_method}）")
 
         for target_date in target_dates:
             if log_callback:
@@ -936,7 +940,8 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
 
         result = subprocess.run(
             [exiftool_path, '-@', argfile_path],
-            capture_output=True, encoding='utf-8', errors='ignore'
+            capture_output=True, encoding='utf-8', errors='ignore',
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         # ExifTool終了コード: 0=成功, 1=軽微な警告(正常扱い), 2=致命的エラー
         if result.returncode >= 2:
@@ -1202,6 +1207,127 @@ def collect_exif_log(exiftool_path: str, dest_dir: Path, file_extensions: set) -
 # -----------------------------
 
 
+class GarminLoginDialog(ctk.CTkToplevel):
+    """
+    ポップアップ: Garmin Connectログイン画面です。
+    email + password入力 → ログイン → MFA必要時はMFAコード入力画面を表示します。
+    設定タブの「ログインテスト」およびダウンロード時の両方で使用します。
+    """
+
+    def __init__(self, master: ctk.CTkBaseClass, log_callback: Optional[Callable[[str], None]] = None):
+        super().__init__(master)
+        self.title("Garmin Connect ログイン")
+        self.geometry("450x280")
+        self.transient(master)
+        self.resizable(False, False)
+
+        self.login_success: bool = False
+        self._log_callback = log_callback
+        # MFA用のスレッド間通信キュー
+        self._mfa_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self,
+            text="Garmin Connectにログインしてください。",
+            font=("Yu Gothic UI", 14),
+            wraplength=400,
+        ).pack(pady=(20, 10))
+
+        # Email
+        email_frame = ctk.CTkFrame(self, fg_color="transparent")
+        email_frame.pack(pady=5, padx=30, fill="x")
+        ctk.CTkLabel(email_frame, text="Email:", font=("Yu Gothic UI", 13), width=80, anchor="w").pack(side="left")
+        self.email_entry = ctk.CTkEntry(email_frame, font=("Yu Gothic UI", 13))
+        self.email_entry.pack(side="left", fill="x", expand=True, padx=5)
+
+        # Password
+        pw_frame = ctk.CTkFrame(self, fg_color="transparent")
+        pw_frame.pack(pady=5, padx=30, fill="x")
+        ctk.CTkLabel(pw_frame, text="Password:", font=("Yu Gothic UI", 13), width=80, anchor="w").pack(side="left")
+        self.password_entry = ctk.CTkEntry(pw_frame, font=("Yu Gothic UI", 13), show="●")
+        self.password_entry.pack(side="left", fill="x", expand=True, padx=5)
+        self.password_entry.bind("<Return>", lambda _: self._on_login())
+
+        # ステータスラベル
+        self.status_label = ctk.CTkLabel(
+            self, text="", font=("Yu Gothic UI", 12), text_color="gray"
+        )
+        self.status_label.pack(pady=5)
+
+        # ボタン
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        self.login_button = ctk.CTkButton(btn_frame, text="ログイン", width=120, command=self._on_login)
+        self.login_button.pack(side="left", padx=6)
+        ctk.CTkButton(btn_frame, text="キャンセル", width=120, command=self._on_cancel).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.email_entry.focus_force()
+
+    def _prompt_mfa(self) -> str:
+        """バックグラウンドスレッドから呼ばれるMFAコールバック。メインスレッドでMFAダイアログを表示。"""
+        def _show_mfa_dialog() -> None:
+            self.status_label.configure(text="🔐 二段階認証コードを入力してください...", text_color="orange")
+            dialog = MFAInputDialog(self)
+            dialog.wait_window()
+            self._mfa_queue.put(dialog.mfa_code)
+
+        self.after(0, _show_mfa_dialog)
+        code = self._mfa_queue.get()
+        if code is None:
+            raise GarminConnectAuthenticationError("MFA認証がキャンセルされました。")
+        return code
+
+    def _on_login(self) -> None:
+        email = self.email_entry.get().strip()
+        password = self.password_entry.get().strip()
+        if not email or not password:
+            self.status_label.configure(text="❌ Email と Password を入力してください", text_color="red")
+            return
+
+        self.login_button.configure(state="disabled")
+        self.status_label.configure(text="ログイン中...", text_color="gray")
+
+        def _login_worker():
+            tokenstore_dir = _get_garmin_tokenstore_dir()
+            tokenstore_path = str(tokenstore_dir)
+            try:
+                api, login_method = _garmin_login_with_retry(
+                    tokenstore_dir, tokenstore_path,
+                    email=email, password=password,
+                    log_callback=self._log_callback,
+                    prompt_mfa=self._prompt_mfa,
+                )
+                self.login_success = True
+                self.after(0, lambda: self._on_login_success(login_method))
+            except Exception as e:
+                error_msg = str(e)
+                if _is_rate_limit_error(e):
+                    error_msg = "レート制限（429）。しばらく時間をおいてください。"
+                self.after(0, lambda msg=error_msg: self._on_login_failure(msg))
+
+        threading.Thread(target=_login_worker, daemon=True).start()
+
+    def _on_login_success(self, login_method: str) -> None:
+        self.status_label.configure(text=f"✅ ログイン成功（{login_method}）", text_color="#2FA84F")
+        self.after(1000, self._close_success)
+
+    def _close_success(self) -> None:
+        self.grab_release()
+        self.destroy()
+
+    def _on_login_failure(self, error_msg: str) -> None:
+        self.login_button.configure(state="normal")
+        self.status_label.configure(text=f"❌ {error_msg}", text_color="red")
+
+    def _on_cancel(self) -> None:
+        self.login_success = False
+        self.grab_release()
+        self.destroy()
+
+
 class MFAInputDialog(ctk.CTkToplevel):
     """
     ポップアップ: Garmin二段階認証（MFA）のワンタイムコード入力画面です。
@@ -1294,6 +1420,7 @@ class DownloadLogPopup(ctk.CTkToplevel):
     def start_download(self) -> None:
         """
         ダウンロード処理を別スレッドで開始します。
+        トークンキャッシュがあればそのまま進行、なければログインポップアップを表示します。
         """
         # 設定から保存先を取得します。
         settings = SettingsManager.load()
@@ -1303,20 +1430,19 @@ class DownloadLogPopup(ctk.CTkToplevel):
             self.after(0, lambda: self.close_button.configure(state="normal"))
             return
 
-        # Garminの認証情報を取得します。
-        email = settings.get("email", "")
-        password = decode_password(settings.get("password_encoded", ""))
-        if not email or not password:
-            self.update_log("エラー: Garminのユーザー名とパスワードが設定されていません。")
-            self.after(0, lambda: self.close_button.configure(state="normal"))
+        # トークンキャッシュの存在を確認します。
+        tokenstore_dir = _get_garmin_tokenstore_dir()
+        token_file = tokenstore_dir / "garmin_tokens.json"
+        if not token_file.exists():
+            # トークンがない場合はログインポップアップを表示
+            self.update_log("トークンキャッシュが見つかりません。ログインが必要です。")
+            self._show_login_then_download(gpx_dir, settings)
             return
 
         # 日付リストを作成します。
         if self.selected_dates:
-            # スキャンで取得した日付を使用
             target_dates = self.selected_dates
         else:
-            # 範囲指定の日付を使用
             target_dates = []
             current_date = self.start_date
             while current_date <= self.end_date:
@@ -1327,7 +1453,39 @@ class DownloadLogPopup(ctk.CTkToplevel):
         download_format = settings.get("activity_download_format", "gpx")
         
         # ダウンロード処理を実行します。
-        self.download_worker(target_dates, Path(gpx_dir), email, password, download_format)
+        self.download_worker(target_dates, Path(gpx_dir), download_format)
+
+    def _show_login_then_download(self, gpx_dir: str, settings: dict) -> None:
+        """ログインポップアップを表示し、成功後にダウンロードを開始します。"""
+        def _on_login_dialog_closed() -> None:
+            if not hasattr(self, '_login_dialog') or not self._login_dialog.login_success:
+                self.update_log("ログインがキャンセルされました。")
+                self.after(0, lambda: self.close_button.configure(state="normal"))
+                return
+
+            # ログイン成功 → ダウンロード開始
+            if self.selected_dates:
+                target_dates = self.selected_dates
+            else:
+                target_dates = []
+                current_date = self.start_date
+                while current_date <= self.end_date:
+                    target_dates.append(current_date)
+                    current_date += timedelta(days=1)
+
+            download_format = settings.get("activity_download_format", "gpx")
+            threading.Thread(
+                target=self.download_worker,
+                args=(target_dates, Path(gpx_dir), download_format),
+                daemon=True
+            ).start()
+
+        def _show_dialog() -> None:
+            self._login_dialog = GarminLoginDialog(self, log_callback=self.update_log)
+            self._login_dialog.wait_window()
+            _on_login_dialog_closed()
+
+        self.after(0, _show_dialog)
 
     def _prompt_mfa_threadsafe(self) -> str:
         """
@@ -1349,24 +1507,24 @@ class DownloadLogPopup(ctk.CTkToplevel):
         return code
 
     def download_worker(
-        self, target_dates: List[date], gpx_dir: Path, email: str, password: str,
+        self, target_dates: List[date], gpx_dir: Path,
         download_format: str = "gpx"
     ) -> None:
         """
         実際のダウンロード処理を行います。
+        トークンが期限切れの場合はログインポップアップを表示して再試行します。
         """
         def update_log_callback(message: str) -> None:
             self.update_log(message)
 
         fmt_label = "GPX" if download_format == "gpx" else "TCX"
+        retrying = False
         try:
             self.update_log(f"ダウンロード開始...（形式: {fmt_label}）")
             self.update_log("※ 二段階認証を設定している場合、認証コード入力のポップアップが表示されるまでしばらくお待ちください。")
             downloaded_files = download_garmin_activities_gpx(
                 target_dates,
                 gpx_dir,
-                email,
-                password,
                 log_callback=update_log_callback,
                 download_format=download_format,
                 prompt_mfa=self._prompt_mfa_threadsafe,
@@ -1377,6 +1535,15 @@ class DownloadLogPopup(ctk.CTkToplevel):
             self.update_log(f"ダウンロード完了。{len(downloaded_files)}件のファイルを保存しました。")
             self.update_log("━" * 40)
             self.update_log("✅ ダウンロードが完了しました。このポップアップを閉じてから、「取り込み」を実行してください。")
+        except GarminConnectAuthenticationError as error:
+            if _is_rate_limit_error(error):
+                self.update_log("━" * 40)
+                self.update_log("❌ ダウンロードに失敗しました。エラー内容を確認してください。")
+            else:
+                # トークン期限切れ等 → ログインポップアップ表示して再試行
+                self.update_log("トークンが無効です。再ログインが必要です。")
+                retrying = True
+                self._retry_with_login(target_dates, gpx_dir, download_format)
         except Exception as error:
             error_str = str(error)
             if "429" not in error_str and "Too Many Requests" not in error_str:
@@ -1384,6 +1551,28 @@ class DownloadLogPopup(ctk.CTkToplevel):
             self.update_log("━" * 40)
             self.update_log("❌ ダウンロードに失敗しました。エラー内容を確認してください。")
         finally:
+            if not retrying:
+                self.after(0, lambda: self.close_button.configure(state="normal"))
+
+    def _retry_with_login(self, target_dates: List[date], gpx_dir: Path, download_format: str) -> None:
+        """トークン期限切れ時にログインポップアップを表示し、成功後にダウンロードを再試行します。"""
+        login_result: queue.Queue[bool] = queue.Queue()
+
+        def _show_login() -> None:
+            dialog = GarminLoginDialog(self, log_callback=self.update_log)
+            dialog.wait_window()
+            login_result.put(dialog.login_success)
+
+        self.after(0, _show_login)
+        success = login_result.get()
+
+        if success:
+            self.update_log("再ログイン成功。ダウンロードを再開します...")
+            self.download_worker(target_dates, gpx_dir, download_format)
+        else:
+            self.update_log("ログインがキャンセルされました。")
+            self.update_log("━" * 40)
+            self.update_log("❌ ダウンロードに失敗しました。")
             self.after(0, lambda: self.close_button.configure(state="normal"))
 
     def update_log(self, message: str) -> None:
@@ -2459,7 +2648,7 @@ class MainApp(ctk.CTk):
         # 情報ラベル更新
         if enable_click:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示（テスト中））",
+                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示・表示されない場合はリロード）",
                 text_color="#2FA84F"
             )
         else:
@@ -2565,7 +2754,7 @@ class MainApp(ctk.CTk):
         marker_count = len(self.photo_locations)
         if marker_count <= 500:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示）",
+                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示・表示されない場合はリロード）",
                 text_color="#2FA84F"
             )
         else:
@@ -2586,7 +2775,8 @@ class MainApp(ctk.CTk):
         for tag in ["-ThumbnailImage", "-PreviewImage"]:
             try:
                 command = [exiftool_path, "-b", tag, file_path]
-                result = subprocess.run(command, capture_output=True, check=False, timeout=5)
+                result = subprocess.run(command, capture_output=True, check=False, timeout=5,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
                 
                 if result.returncode == 0 and result.stdout:
                     # バイナリデータをPIL Imageに変換
@@ -2823,26 +3013,26 @@ class MainApp(ctk.CTk):
         # 説明
         ctk.CTkLabel(
             scrollable_frame,
-            text="Garmin Connectのアクティビティをダウンロードするための認証情報と形式を設定します",
+            text="Garmin Connectのアクティビティをダウンロードするための形式を設定します。\nログインはトークンベースで管理されます。",
             font=("Yu Gothic UI", 12),
             text_color="gray"
-        ).pack(pady=(0, 20))
+        ).pack(pady=(0, 10))
         
-        # ユーザー名
-        email_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
-        email_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(email_frame, text="ユーザー名 (Email):", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
-        self.email_entry = ctk.CTkEntry(email_frame, font=("Yu Gothic UI", 14))
-        self.email_entry.insert(0, self.settings.get("email", ""))
-        self.email_entry.pack(side="left", padx=5, fill="x", expand=True)
-        
-        # パスワード
-        password_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
-        password_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(password_frame, text="パスワード:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
-        self.password_entry = ctk.CTkEntry(password_frame, font=("Yu Gothic UI", 14), show="●")
-        self.password_entry.insert(0, decode_password(self.settings.get("password_encoded", "")))
-        self.password_entry.pack(side="left", padx=5, fill="x", expand=True)
+        # ログインテストボタン
+        login_test_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        login_test_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(login_test_frame, text="認証:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        ctk.CTkButton(
+            login_test_frame,
+            text="ログインテスト",
+            command=self._garmin_login_test,
+            font=("Yu Gothic UI", 14),
+            width=150
+        ).pack(side="left", padx=5)
+        self.garmin_login_status_label = ctk.CTkLabel(
+            login_test_frame, text="", font=("Yu Gothic UI", 12)
+        )
+        self.garmin_login_status_label.pack(side="left", padx=10)
         
         # ダウンロード形式
         dl_fmt_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
@@ -3149,12 +3339,34 @@ class MainApp(ctk.CTk):
             self.cache_dir_entry.delete(0, "end")
             self.cache_dir_entry.insert(0, path)
     
+    def _garmin_login_test(self) -> None:
+        """
+        Garmin Connectへのログインテストを行います。
+        GarminLoginDialogを表示してログインを試みます。
+        """
+        self.garmin_login_status_label.configure(text="", text_color="gray")
+
+        def _on_dialog_closed() -> None:
+            if hasattr(self, '_login_test_dialog') and self._login_test_dialog.login_success:
+                self.garmin_login_status_label.configure(
+                    text="✅ ログイン成功。トークンが保存されました。",
+                    text_color="#2FA84F"
+                )
+            else:
+                self.garmin_login_status_label.configure(
+                    text="",
+                    text_color="gray"
+                )
+            self.after(5000, lambda: self.garmin_login_status_label.configure(text=""))
+
+        self._login_test_dialog = GarminLoginDialog(self)
+        self._login_test_dialog.wait_window()
+        _on_dialog_closed()
+    
     def save_settings(self) -> None:
         """
         設定を保存します。
         """
-        email = self.email_entry.get()
-        password = self.password_entry.get()
         cache_dir = self.cache_dir_entry.get()
         custom_extensions = self.extensions_entry.get()
         overwrite_existing_geotag = self.overwrite_existing_geotag_var.get()
@@ -3168,13 +3380,6 @@ class MainApp(ctk.CTk):
         gpx_track_width = self.gpx_track_width_entry.get().strip()
         gpx_track_width = self.gpx_track_width_entry.get().strip()
         camera_timezone = self.camera_timezone_var.get().strip()
-        
-        if not email or not password:
-            self.settings_status_label.configure(
-                text="❌ ユーザー名とパスワードを入力してください",
-                text_color="red"
-            )
-            return
         
         # 座標のバリデーション
         try:
@@ -3268,8 +3473,6 @@ class MainApp(ctk.CTk):
         old_tile_server_max_zoom = str(self.settings.get("tile_server_max_zoom", "16"))
         
         SettingsManager.save({
-            "email": email,
-            "password_encoded": encode_password(password),
             "activity_download_format": self.dl_format_var.get(),
             "cache_dir": cache_dir,
             "custom_extensions": custom_extensions,
@@ -3556,17 +3759,29 @@ class MainApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    # Windows DPI awareness を明示的に設定（Nuitka standalone での表示崩れ防止）
-    if sys.platform == "win32":
+    import traceback as _traceback
+
+    def _write_error_log(text: str) -> None:
         try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            log_path = pathlib.Path.home() / "GeotagPhoto_error.log"
+            log_path.write_text(text, encoding="utf-8")
         except Exception:
             pass
 
-    # CustomTkinterのテーマ設定
-    ctk.set_appearance_mode("System")
-    ctk.set_default_color_theme("blue")
+    try:
+        # Windows DPI awareness を明示的に設定（Nuitka standalone での表示崩れ防止）
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
 
-    app = MainApp()
-    app.mainloop()
+        # CustomTkinterのテーマ設定
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+
+        app = MainApp()
+        app.mainloop()
+    except Exception:
+        _write_error_log(_traceback.format_exc())
