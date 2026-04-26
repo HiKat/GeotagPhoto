@@ -2648,7 +2648,7 @@ class MainApp(ctk.CTk):
         # 情報ラベル更新
         if enable_click:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示（テスト中））",
+                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示・表示されない場合はリロード）",
                 text_color="#2FA84F"
             )
         else:
@@ -2754,7 +2754,7 @@ class MainApp(ctk.CTk):
         marker_count = len(self.photo_locations)
         if marker_count <= 500:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示）",
+                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示・表示されない場合はリロード）",
                 text_color="#2FA84F"
             )
         else:
