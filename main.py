@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import pathlib as _pathlib_early
 import queue
 import random
 import shutil
@@ -27,7 +28,24 @@ import sys
 import tempfile
 import threading
 import time
+import traceback as _traceback_early
 import xml.etree.ElementTree as ET
+
+
+def _early_excepthook(exc_type, exc_value, exc_tb):
+    """起動時の未捕捉例外をログファイルに記録します（Nuitka診断用）。"""
+    try:
+        log = _pathlib_early.Path.home() / "GeotagPhoto_error.log"
+        log.write_text(
+            "".join(_traceback_early.format_exception(exc_type, exc_value, exc_tb)),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _early_excepthook
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -3741,17 +3759,29 @@ class MainApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    # Windows DPI awareness を明示的に設定（Nuitka standalone での表示崩れ防止）
-    if sys.platform == "win32":
+    import traceback as _traceback
+
+    def _write_error_log(text: str) -> None:
         try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            log_path = pathlib.Path.home() / "GeotagPhoto_error.log"
+            log_path.write_text(text, encoding="utf-8")
         except Exception:
             pass
 
-    # CustomTkinterのテーマ設定
-    ctk.set_appearance_mode("System")
-    ctk.set_default_color_theme("blue")
+    try:
+        # Windows DPI awareness を明示的に設定（Nuitka standalone での表示崩れ防止）
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
 
-    app = MainApp()
-    app.mainloop()
+        # CustomTkinterのテーマ設定
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+
+        app = MainApp()
+        app.mainloop()
+    except Exception:
+        _write_error_log(_traceback.format_exc())
