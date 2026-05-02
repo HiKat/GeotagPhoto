@@ -1203,6 +1203,359 @@ def collect_exif_log(exiftool_path: str, dest_dir: Path, file_extensions: set) -
 
 
 # -----------------------------
+# Strava 連携ユーティリティ
+# -----------------------------
+
+def _get_strava_token_path() -> Path:
+    """Stravaトークンの保存先パスを返します。"""
+    cache_dir_str = SettingsManager.load().get("cache_dir", str(SettingsManager._get_default_dir()))
+    cache_dir = Path(cache_dir_str)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "strava_tokens.json"
+
+
+def _strava_load_tokens() -> Optional[dict]:
+    """保存済みStravaトークンを読み込みます。存在しない場合はNoneを返します。"""
+    token_path = _get_strava_token_path()
+    if not token_path.exists():
+        return None
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _strava_save_tokens(tokens: dict) -> None:
+    """Stravaトークンをファイルに保存します。"""
+    token_path = _get_strava_token_path()
+    with open(token_path, "w", encoding="utf-8") as f:
+        json.dump(tokens, f, ensure_ascii=False, indent=2)
+
+
+def _strava_refresh_tokens(client_id: str, client_secret: str, refresh_token: str) -> dict:
+    """
+    Stravaのアクセストークンをリフレッシュして新しいトークンを取得します。
+    取得したトークンを保存して返します。
+    """
+    import urllib.request
+    import urllib.parse
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.strava.com/oauth/token",
+        data=payload,
+        method="POST"
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        tokens = json.loads(resp.read().decode("utf-8"))
+    _strava_save_tokens(tokens)
+    return tokens
+
+
+def _strava_get_valid_access_token(client_id: str, client_secret: str) -> Optional[str]:
+    """
+    有効なStravaアクセストークンを返します。
+    期限切れの場合はリフレッシュします。トークンが存在しない場合はNoneを返します。
+    """
+    tokens = _strava_load_tokens()
+    if tokens is None:
+        return None
+    # expires_at と現在時刻を比較（60秒のマージンを持たせる）
+    if time.time() < tokens.get("expires_at", 0) - 60:
+        return tokens.get("access_token")
+    # リフレッシュが必要
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        return None
+    new_tokens = _strava_refresh_tokens(client_id, client_secret, refresh_token)
+    return new_tokens.get("access_token")
+
+
+def _strava_oauth_flow(client_id: str, client_secret: str, log_callback: Callable[[str], None]) -> Optional[dict]:
+    """
+    Stravaの OAuth 2.0 ブラウザ認証フローを実行します。
+    ローカルHTTPサーバーを起動してコールバックを受け取り、
+    アクセストークンを取得して保存します。
+
+    Returns:
+        取得したトークン辞書。失敗した場合はNone。
+    """
+    import http.server
+    import urllib.parse
+    import urllib.request
+    import webbrowser
+
+    # ランダムなポートを選択
+    import socket
+    sock = socket.socket()
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    redirect_uri = f"http://localhost:{port}/callback"
+    auth_code_holder: List[Optional[str]] = [None]
+    server_ready = threading.Event()
+    server_done = threading.Event()
+
+    class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            code = params.get("code", [None])[0]
+            auth_code_holder[0] = code
+            # 認証完了ページを返す
+            html = (
+                "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                "<h2>✅ 認証が完了しました</h2>"
+                "<p>このウィンドウを閉じて、アプリに戻ってください。</p>"
+                "</body></html>"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            server_done.set()
+
+        def log_message(self, fmt, *args):
+            pass  # ログ抑制
+
+    httpd = http.server.HTTPServer(("", port), _CallbackHandler)
+    httpd.timeout = 1  # 1秒タイムアウトで繰り返しポーリング
+
+    def _server_thread():
+        server_ready.set()
+        deadline = time.time() + 180  # 3分でタイムアウト
+        while not server_done.is_set() and time.time() < deadline:
+            httpd.handle_request()
+        httpd.server_close()
+
+    t = threading.Thread(target=_server_thread, daemon=True)
+    t.start()
+    server_ready.wait()
+
+    # 認証URLを組み立てる
+    scope = "activity:read_all"
+    auth_url = (
+        f"https://www.strava.com/oauth/authorize"
+        f"?client_id={urllib.parse.quote(client_id)}"
+        f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
+        f"&response_type=code"
+        f"&scope={urllib.parse.quote(scope)}"
+    )
+
+    log_callback("ブラウザを開いてStrava認証を行います...")
+    log_callback("認証が完了すると自動的に続行されます（最大3分）")
+    webbrowser.open(auth_url)
+
+    # コールバックを待機
+    server_done.wait(timeout=180)
+    t.join(timeout=5)
+
+    code = auth_code_holder[0]
+    if not code:
+        log_callback("❌ Strava認証がタイムアウトまたはキャンセルされました。")
+        return None
+
+    log_callback("認証コードを取得しました。トークンを交換中...")
+
+    # コードをアクセストークンに交換
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.strava.com/oauth/token",
+        data=payload,
+        method="POST"
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            tokens = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log_callback(f"❌ トークン取得に失敗しました: {e}")
+        return None
+
+    _strava_save_tokens(tokens)
+    log_callback("✅ Stravaトークンを取得・保存しました。")
+    return tokens
+
+
+def _strava_fetch_activities(access_token: str, after_ts: int, before_ts: int) -> List[dict]:
+    """指定期間のStravaアクティビティ一覧を取得します。"""
+    import urllib.request
+    activities = []
+    page = 1
+    while True:
+        url = (
+            f"https://www.strava.com/api/v3/athlete/activities"
+            f"?after={after_ts}&before={before_ts}&per_page=100&page={page}"
+        )
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {access_token}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            batch = json.loads(resp.read().decode("utf-8"))
+        if not batch:
+            break
+        activities.extend(batch)
+        page += 1
+    return activities
+
+
+def _strava_fetch_streams(access_token: str, activity_id: int) -> Optional[dict]:
+    """アクティビティのGPSストリームを取得します。"""
+    import urllib.request
+    url = (
+        f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
+        f"?keys=latlng,time&key_by_type=true"
+    )
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _build_gpx_from_strava(activity: dict, streams: dict) -> str:
+    """StravaストリームデータからGPX XML文字列を生成します。"""
+    import xml.etree.ElementTree as ET2
+
+    latlng_data = streams.get("latlng", {}).get("data", [])
+    time_data = streams.get("time", {}).get("data", [])
+    if not latlng_data:
+        return ""
+
+    # アクティビティ開始時刻（ISO8601形式）
+    start_date_str = activity.get("start_date", "")
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        start_dt = datetime.utcnow()
+
+    root = ET2.Element("gpx", {
+        "version": "1.1",
+        "creator": "GeotagPhoto (Strava)",
+        "xmlns": "http://www.topografix.com/GPX/1/1",
+    })
+    trk = ET2.SubElement(root, "trk")
+    name_el = ET2.SubElement(trk, "name")
+    name_el.text = activity.get("name", "Strava Activity")
+    trkseg = ET2.SubElement(trk, "trkseg")
+
+    for i, (lat, lng) in enumerate(latlng_data):
+        trkpt = ET2.SubElement(trkseg, "trkpt", {
+            "lat": str(lat),
+            "lon": str(lng),
+        })
+        # 時刻を計算
+        elapsed = time_data[i] if i < len(time_data) else 0
+        pt_dt = start_dt + timedelta(seconds=elapsed)
+        time_el = ET2.SubElement(trkpt, "time")
+        time_el.text = pt_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return ET2.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+def download_strava_activities(
+    target_dates: List[date],
+    output_dir: Path,
+    log_callback: Callable[[str], None],
+    client_id: str,
+    client_secret: str,
+) -> List[Path]:
+    """
+    Stravaから指定した日付のアクティビティをGPXとしてダウンロードします。
+
+    Args:
+        target_dates: ダウンロード対象の日付リスト。
+        output_dir: GPXファイルの保存先ディレクトリ。
+        log_callback: ログ出力コールバック。
+        client_id: Strava APIクライアントID。
+        client_secret: Strava APIクライアントシークレット。
+
+    Returns:
+        保存されたGPXファイルのパスリスト。
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # トークン取得（既存のものを使用、期限切れならリフレッシュ、なければOAuth）
+    access_token = _strava_get_valid_access_token(client_id, client_secret)
+    if access_token is None:
+        log_callback("Stravaトークンがありません。ブラウザで認証を行います...")
+        tokens = _strava_oauth_flow(client_id, client_secret, log_callback)
+        if tokens is None:
+            return []
+        access_token = tokens.get("access_token")
+        if not access_token:
+            log_callback("❌ アクセストークンの取得に失敗しました。")
+            return []
+
+    # 日付範囲をUNIXタイムスタンプに変換（UTC基準）
+    min_date = min(target_dates)
+    max_date = max(target_dates)
+    after_ts = int(datetime(min_date.year, min_date.month, min_date.day, 0, 0, 0).timestamp())
+    before_ts = int(datetime(max_date.year, max_date.month, max_date.day, 23, 59, 59).timestamp())
+
+    log_callback(f"Stravaアクティビティを検索中... ({min_date} ～ {max_date})")
+    try:
+        activities = _strava_fetch_activities(access_token, after_ts, before_ts)
+    except Exception as e:
+        log_callback(f"❌ アクティビティ一覧の取得に失敗しました: {e}")
+        return []
+
+    if not activities:
+        log_callback("指定期間にアクティビティが見つかりませんでした。")
+        return []
+
+    log_callback(f"{len(activities)}件のアクティビティが見つかりました。")
+    target_date_set = set(target_dates)
+    saved_files: List[Path] = []
+
+    for activity in activities:
+        start_date_str = activity.get("start_date_local", activity.get("start_date", ""))
+        try:
+            act_date = datetime.strptime(start_date_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        if act_date not in target_date_set:
+            continue
+
+        activity_id = activity.get("id")
+        activity_name = activity.get("name", f"activity_{activity_id}")
+        log_callback(f"  📥 {act_date} - {activity_name} (ID: {activity_id})")
+
+        streams = _strava_fetch_streams(access_token, activity_id)
+        if not streams or "latlng" not in streams:
+            log_callback(f"    ⚠️ GPS データなし（スキップ）")
+            continue
+
+        gpx_content = _build_gpx_from_strava(activity, streams)
+        if not gpx_content:
+            log_callback(f"    ⚠️ GPX生成に失敗しました（スキップ）")
+            continue
+
+        # ファイル名をサニタイズ
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in activity_name)
+        gpx_path = output_dir / f"strava_{act_date}_{safe_name[:40]}_{activity_id}.gpx"
+        gpx_path.write_text(gpx_content, encoding="utf-8")
+        saved_files.append(gpx_path)
+        log_callback(f"    ✅ 保存: {gpx_path.name}")
+
+    return saved_files
+
+
+# -----------------------------
 # UI (ポップアップやメイン画面)
 # -----------------------------
 
@@ -1582,6 +1935,95 @@ class DownloadLogPopup(ctk.CTkToplevel):
         # コンソールに出力
         print(message)
         # UI更新
+        def update_ui() -> None:
+            self.log_textbox.insert("end", message + "\n")
+            self.log_textbox.see("end")
+
+        self.after(0, update_ui)
+
+
+class StravaDownloadPopup(ctk.CTkToplevel):
+    """
+    ポップアップ: Stravaからのアクティビティダウンロードログを表示する画面です。
+    """
+
+    def __init__(
+        self,
+        master: ctk.CTk,
+        start_date: date,
+        end_date: Optional[date],
+        selected_dates: Optional[List[date]] = None,
+    ):
+        super().__init__(master)
+        self.title("Stravaダウンロード中...")
+        self.geometry("600x300")
+        self.transient(master)
+
+        self.start_date = start_date
+        self.end_date = end_date or start_date
+        self.selected_dates = selected_dates
+        self.grab_set()
+
+        ctk.CTkLabel(self, text="Strava ダウンロード実行ログ", font=("Yu Gothic UI", 14)).pack(pady=10)
+
+        self.log_textbox = ctk.CTkTextbox(self, width=580, height=330)
+        self.log_textbox.pack(padx=10, pady=10, fill="both", expand=True)
+
+        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame.pack(pady=10)
+
+        self.close_button = ctk.CTkButton(button_frame, text="閉じる", command=self.destroy, state="disabled")
+        self.close_button.pack(side="left", padx=6)
+
+        threading.Thread(target=self.start_download, daemon=True).start()
+
+    def start_download(self) -> None:
+        """Stravaダウンロード処理を実行します。"""
+        settings = SettingsManager.load()
+        gpx_dir = settings.get("gpx_dir")
+        if not gpx_dir:
+            self.update_log("エラー: GPX保存先が設定されていません。")
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+            return
+
+        client_id = settings.get("strava_client_id", "").strip()
+        client_secret = settings.get("strava_client_secret", "").strip()
+        if not client_id or not client_secret:
+            self.update_log("❌ 設定タブで Strava Client ID と Client Secret を入力してください。")
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+            return
+
+        if self.selected_dates:
+            target_dates = self.selected_dates
+        else:
+            target_dates = []
+            current_date = self.start_date
+            while current_date <= self.end_date:
+                target_dates.append(current_date)
+                current_date += timedelta(days=1)
+
+        try:
+            downloaded_files = download_strava_activities(
+                target_dates=target_dates,
+                output_dir=Path(gpx_dir),
+                log_callback=self.update_log,
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+            if isinstance(self.master, MainApp):
+                self.master.downloaded_gpx_files = downloaded_files
+            self.update_log(f"ダウンロード完了。{len(downloaded_files)}件のGPXを保存しました。")
+            self.update_log("━" * 40)
+            self.update_log("✅ ダウンロードが完了しました。このポップアップを閉じてから、「取り込み」を実行してください。")
+        except Exception as e:
+            self.update_log(f"❌ ダウンロード中にエラーが発生しました: {e}")
+        finally:
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+
+    def update_log(self, message: str) -> None:
+        """ログを表示します。"""
+        print(message)
+
         def update_ui() -> None:
             self.log_textbox.insert("end", message + "\n")
             self.log_textbox.see("end")
@@ -2281,6 +2723,21 @@ class MainApp(ctk.CTk):
 
         ctk.CTkLabel(frame, text="アクティビティダウンロード", font=("Yu Gothic UI", 20, "bold")).pack(pady=(20, 4))
 
+        # 連携サービス選択
+        service_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        service_frame.pack(pady=(4, 8))
+        ctk.CTkLabel(service_frame, text="連携サービス:", font=("Yu Gothic UI", 16)).pack(side="left", padx=(0, 8))
+        current_service = self.settings.get("connected_service", "Garmin")
+        self.connected_service_var = ctk.StringVar(value=current_service)
+        ctk.CTkOptionMenu(
+            service_frame,
+            values=["Garmin", "Strava"],
+            variable=self.connected_service_var,
+            font=("Yu Gothic UI", 16),
+            width=160,
+            command=self._on_service_changed,
+        ).pack(side="left")
+
         # カレンダー用の固定サイズフレーム
         calendar_frame = ctk.CTkFrame(frame)
         calendar_frame.pack(pady=10, padx=10)
@@ -2291,9 +2748,6 @@ class MainApp(ctk.CTk):
 
         self.range_label = ctk.CTkLabel(frame, text="日付範囲: 未選択", font=("Yu Gothic UI", 18))
         self.range_label.pack(pady=4)
-
-        # self.download_log_label = ctk.CTkLabel(frame, text="", font=("Yu Gothic UI", 12))
-        # self.download_log_label.pack(pady=4)
 
         button_frame = ctk.CTkFrame(frame, fg_color="transparent")
         button_frame.pack(pady=(20, 30))
@@ -2313,6 +2767,10 @@ class MainApp(ctk.CTk):
             font=("Yu Gothic UI", 18),
             fg_color="#2B7DE9"
         ).pack(side="left", padx=6)
+
+    def _on_service_changed(self, value: str) -> None:
+        """連携サービスの選択が変更されたときに設定を保存します。"""
+        SettingsManager.save({"connected_service": value})
 
     def create_dir_selector(self, parent_frame, label_text: str, key: str, button_text: str = "選択") -> ctk.CTkEntry:
         """
@@ -3003,37 +3461,21 @@ class MainApp(ctk.CTk):
             width=80
         ).pack(side="left", padx=5)
         
-        # === Garmin Connect設定 ===
+        # === アクティビティダウンロード設定 ===
         ctk.CTkLabel(
             scrollable_frame, 
-            text="Garmin Connect 設定", 
+            text="アクティビティダウンロード設定", 
             font=("Yu Gothic UI", 20, "bold")
         ).pack(pady=(20, 10))
         
         # 説明
         ctk.CTkLabel(
             scrollable_frame,
-            text="Garmin Connectのアクティビティをダウンロードするための形式を設定します。\nログインはトークンベースで管理されます。",
+            text="アクティビティのダウンロード形式と、連携サービスの認証情報を設定します。",
             font=("Yu Gothic UI", 12),
             text_color="gray"
         ).pack(pady=(0, 10))
-        
-        # ログインテストボタン
-        login_test_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
-        login_test_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(login_test_frame, text="認証:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
-        ctk.CTkButton(
-            login_test_frame,
-            text="ログインテスト",
-            command=self._garmin_login_test,
-            font=("Yu Gothic UI", 14),
-            width=150
-        ).pack(side="left", padx=5)
-        self.garmin_login_status_label = ctk.CTkLabel(
-            login_test_frame, text="", font=("Yu Gothic UI", 12)
-        )
-        self.garmin_login_status_label.pack(side="left", padx=10)
-        
+
         # ダウンロード形式
         dl_fmt_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
         dl_fmt_frame.pack(pady=5, padx=40, fill="x")
@@ -3055,6 +3497,85 @@ class MainApp(ctk.CTk):
             value="tcx",
             font=("Yu Gothic UI", 14)
         ).pack(side="left", padx=10)
+
+        # --- Garmin Connect ---
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="Garmin Connect",
+            font=("Yu Gothic UI", 16, "bold")
+        ).pack(pady=(20, 4), anchor="w", padx=40)
+
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="ログインはトークンベースで管理されます。",
+            font=("Yu Gothic UI", 12),
+            text_color="gray"
+        ).pack(pady=(0, 6), anchor="w", padx=40)
+
+        # ログインテストボタン
+        login_test_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        login_test_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(login_test_frame, text="認証:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        ctk.CTkButton(
+            login_test_frame,
+            text="ログインテスト",
+            command=self._garmin_login_test,
+            font=("Yu Gothic UI", 14),
+            width=150
+        ).pack(side="left", padx=5)
+        self.garmin_login_status_label = ctk.CTkLabel(
+            login_test_frame, text="", font=("Yu Gothic UI", 12)
+        )
+        self.garmin_login_status_label.pack(side="left", padx=10)
+
+        # --- Strava ---
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="Strava",
+            font=("Yu Gothic UI", 16, "bold")
+        ).pack(pady=(20, 4), anchor="w", padx=40)
+
+        ctk.CTkLabel(
+            scrollable_frame,
+            text=(
+                "Strava API アプリを https://www.strava.com/settings/api で作成し、\n"
+                "取得した Client ID と Client Secret を入力してください。\n"
+                "初回ダウンロード時にブラウザで OAuth 認証が行われます。"
+            ),
+            font=("Yu Gothic UI", 12),
+            text_color="gray",
+            justify="left",
+            wraplength=600,
+        ).pack(pady=(0, 8), anchor="w", padx=40)
+
+        strava_id_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        strava_id_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(strava_id_frame, text="Client ID:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        self.strava_client_id_entry = ctk.CTkEntry(strava_id_frame, font=("Yu Gothic UI", 14), width=300)
+        self.strava_client_id_entry.insert(0, self.settings.get("strava_client_id", ""))
+        self.strava_client_id_entry.pack(side="left", padx=5)
+
+        strava_secret_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        strava_secret_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(strava_secret_frame, text="Client Secret:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        self.strava_client_secret_entry = ctk.CTkEntry(strava_secret_frame, font=("Yu Gothic UI", 14), width=300, show="*")
+        self.strava_client_secret_entry.insert(0, self.settings.get("strava_client_secret", ""))
+        self.strava_client_secret_entry.pack(side="left", padx=5)
+
+        # Stravaトークンリセットボタン
+        strava_reset_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        strava_reset_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(strava_reset_frame, text="認証トークン:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        ctk.CTkButton(
+            strava_reset_frame,
+            text="トークンをリセット（再認証）",
+            command=self._strava_reset_token,
+            font=("Yu Gothic UI", 14),
+            width=200,
+        ).pack(side="left", padx=5)
+        self.strava_token_status_label = ctk.CTkLabel(strava_reset_frame, text="", font=("Yu Gothic UI", 12))
+        self.strava_token_status_label.pack(side="left", padx=10)
+        self._update_strava_token_status()
         
         # === RAW拡張子設定 ===
         ctk.CTkLabel(
@@ -3339,6 +3860,39 @@ class MainApp(ctk.CTk):
             self.cache_dir_entry.delete(0, "end")
             self.cache_dir_entry.insert(0, path)
     
+    def _update_strava_token_status(self) -> None:
+        """Stravaトークンの有無をラベルに反映します。"""
+        if not hasattr(self, "strava_token_status_label"):
+            return
+        tokens = _strava_load_tokens()
+        if tokens:
+            import time as _t
+            expires_at = tokens.get("expires_at", 0)
+            if _t.time() < expires_at - 60:
+                self.strava_token_status_label.configure(
+                    text="✅ トークン有効", text_color="#2FA84F"
+                )
+            else:
+                self.strava_token_status_label.configure(
+                    text="⚠️ トークン期限切れ（次回ダウンロード時に自動更新）", text_color="#E8A030"
+                )
+        else:
+            self.strava_token_status_label.configure(
+                text="（未認証）", text_color="gray"
+            )
+
+    def _strava_reset_token(self) -> None:
+        """Stravaトークンファイルを削除し、次回認証を促します。"""
+        token_path = _get_strava_token_path()
+        if token_path.exists():
+            token_path.unlink()
+        self._update_strava_token_status()
+        if hasattr(self, "strava_token_status_label"):
+            self.strava_token_status_label.configure(
+                text="🗑️ トークンを削除しました。次回ダウンロード時に再認証されます。",
+                text_color="gray"
+            )
+
     def _garmin_login_test(self) -> None:
         """
         Garmin Connectへのログインテストを行います。
@@ -3486,7 +4040,9 @@ class MainApp(ctk.CTk):
             "tile_server_max_zoom": max_zoom_val,
             "gpx_track_color": gpx_track_color,
             "gpx_track_width": track_width_val,
-            "camera_timezone": camera_timezone
+            "camera_timezone": camera_timezone,
+            "strava_client_id": self.strava_client_id_entry.get().strip(),
+            "strava_client_secret": self.strava_client_secret_entry.get().strip(),
         })
         
         # 設定を再読み込み
@@ -3743,19 +4299,32 @@ class MainApp(ctk.CTk):
 
     def start_download(self) -> None:
         """
-        ダウンロード処理を別スレッドで開始します。
+        ダウンロード処理を開始します。
+        選択された連携サービス（Garmin / Strava）に応じて処理を分岐します。
         """
-        # スキャンした日付がある場合はそれを使用、なければ手動選択の日付を使用
+        service = self.connected_service_var.get() if hasattr(self, "connected_service_var") else "Garmin"
+
+        # 日付を決定
         if self.selected_dates:
-            # selected_datesをリストに変換してダウンロード
             dates_list = sorted(self.selected_dates)
-            DownloadLogPopup(self, dates_list[0], dates_list[-1], selected_dates=dates_list)
+            start = dates_list[0]
+            end = dates_list[-1]
+            selected = dates_list
         elif self.start_date:
-            # ログ表示ポップアップを開く
-            DownloadLogPopup(self, self.start_date, self.end_date)
+            start = self.start_date
+            end = self.end_date
+            selected = None
         else:
             messagebox.showwarning("確認", "日付を選択してください。")
             return
+
+        if service == "Strava":
+            StravaDownloadPopup(self, start, end, selected_dates=selected)
+        else:
+            if selected:
+                DownloadLogPopup(self, start, end, selected_dates=selected)
+            else:
+                DownloadLogPopup(self, start, end)
 
 
 if __name__ == "__main__":
