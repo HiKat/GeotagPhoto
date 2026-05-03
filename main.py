@@ -3516,16 +3516,16 @@ class MainApp(ctk.CTk):
             text_color="gray"
         ).pack(pady=(0, 6), anchor="w", padx=40)
 
-        # ログインテストボタン
+        # 認証トークン取得ボタン
         login_test_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
         login_test_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(login_test_frame, text="認証:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        ctk.CTkLabel(login_test_frame, text="認証トークン:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
         ctk.CTkButton(
             login_test_frame,
-            text="ログインテスト",
+            text="認証トークン取得（再認証）",
             command=self._garmin_login_test,
             font=("Yu Gothic UI", 14),
-            width=150
+            width=200
         ).pack(side="left", padx=5)
         self.garmin_login_status_label = ctk.CTkLabel(
             login_test_frame, text="", font=("Yu Gothic UI", 12)
@@ -3566,13 +3566,13 @@ class MainApp(ctk.CTk):
         self.strava_client_secret_entry.insert(0, self.settings.get("strava_client_secret", ""))
         self.strava_client_secret_entry.pack(side="left", padx=5)
 
-        # Stravaトークンリセットボタン
+        # Stravaトークン取得/再認証ボタン
         strava_reset_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
         strava_reset_frame.pack(pady=5, padx=40, fill="x")
         ctk.CTkLabel(strava_reset_frame, text="認証トークン:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
         ctk.CTkButton(
             strava_reset_frame,
-            text="トークンをリセット（再認証）",
+            text="認証トークン取得（再認証）",
             command=self._strava_reset_token,
             font=("Yu Gothic UI", 14),
             width=200,
