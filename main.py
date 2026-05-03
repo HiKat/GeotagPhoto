@@ -1942,6 +1942,107 @@ class DownloadLogPopup(ctk.CTkToplevel):
         self.after(0, update_ui)
 
 
+class StravaAuthDialog(ctk.CTkToplevel):
+    """
+    Strava OAuth認証ダイアログ。
+    Client ID / Client Secret を入力してブラウザ OAuth 認証を実行します。
+    """
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Strava 認証")
+        self.geometry("600x420")
+        self.transient(master)
+        self.grab_set()
+        self.auth_success = False
+
+        settings = SettingsManager.load()
+
+        ctk.CTkLabel(
+            self, text="Strava 認証トークン取得", font=("Yu Gothic UI", 16, "bold")
+        ).pack(pady=(20, 6))
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "https://www.strava.com/settings/api でアプリを作成し、\n"
+                "Client ID と Client Secret を入力してから「認証を開始」を押してください。"
+            ),
+            font=("Yu Gothic UI", 12),
+            text_color="gray",
+            justify="left",
+            wraplength=560,
+        ).pack(pady=(0, 10), padx=20, anchor="w")
+
+        id_frame = ctk.CTkFrame(self, fg_color="transparent")
+        id_frame.pack(pady=4, padx=20, fill="x")
+        ctk.CTkLabel(id_frame, text="Client ID:", font=("Yu Gothic UI", 14), width=120, anchor="w").pack(side="left", padx=5)
+        self.client_id_entry = ctk.CTkEntry(id_frame, font=("Yu Gothic UI", 14), width=380)
+        self.client_id_entry.insert(0, settings.get("strava_client_id", ""))
+        self.client_id_entry.pack(side="left", padx=5)
+
+        secret_frame = ctk.CTkFrame(self, fg_color="transparent")
+        secret_frame.pack(pady=4, padx=20, fill="x")
+        ctk.CTkLabel(secret_frame, text="Client Secret:", font=("Yu Gothic UI", 14), width=120, anchor="w").pack(side="left", padx=5)
+        self.client_secret_entry = ctk.CTkEntry(secret_frame, font=("Yu Gothic UI", 14), width=380, show="*")
+        self.client_secret_entry.insert(0, settings.get("strava_client_secret", ""))
+        self.client_secret_entry.pack(side="left", padx=5)
+
+        self.log_textbox = ctk.CTkTextbox(self, width=560, height=130)
+        self.log_textbox.pack(padx=20, pady=10, fill="both", expand=True)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=10)
+
+        self.auth_button = ctk.CTkButton(
+            btn_frame, text="認証を開始", command=self._start_auth,
+            font=("Yu Gothic UI", 14), width=160, fg_color="#2B7DE9"
+        )
+        self.auth_button.pack(side="left", padx=6)
+
+        self.close_button = ctk.CTkButton(
+            btn_frame, text="閉じる", command=self.destroy,
+            font=("Yu Gothic UI", 14), width=100, state="disabled"
+        )
+        self.close_button.pack(side="left", padx=6)
+
+    def _start_auth(self) -> None:
+        client_id = self.client_id_entry.get().strip()
+        client_secret = self.client_secret_entry.get().strip()
+        if not client_id or not client_secret:
+            self._log("❌ Client ID と Client Secret を入力してください。")
+            return
+
+        # 認証情報を保存（トークンリフレッシュ時に再利用するため）
+        SettingsManager.save({"strava_client_id": client_id, "strava_client_secret": client_secret})
+        self.auth_button.configure(state="disabled")
+        threading.Thread(target=self._auth_thread, args=(client_id, client_secret), daemon=True).start()
+
+    def _auth_thread(self, client_id: str, client_secret: str) -> None:
+        try:
+            tokens = _strava_oauth_flow(client_id, client_secret, self._log)
+            if tokens:
+                self.auth_success = True
+                self._log("✅ 認証が完了しました。ウィンドウを閉じてください。")
+            else:
+                self._log("❌ 認証に失敗しました。もう一度お試しください。")
+                self.after(0, lambda: self.auth_button.configure(state="normal"))
+        except Exception as e:
+            self._log(f"❌ エラー: {e}")
+            self.after(0, lambda: self.auth_button.configure(state="normal"))
+        finally:
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+
+    def _log(self, message: str) -> None:
+        print(message)
+
+        def update_ui() -> None:
+            self.log_textbox.insert("end", message + "\n")
+            self.log_textbox.see("end")
+
+        self.after(0, update_ui)
+
+
 class StravaDownloadPopup(ctk.CTkToplevel):
     """
     ポップアップ: Stravaからのアクティビティダウンロードログを表示する画面です。
@@ -1989,9 +2090,23 @@ class StravaDownloadPopup(ctk.CTkToplevel):
         client_id = settings.get("strava_client_id", "").strip()
         client_secret = settings.get("strava_client_secret", "").strip()
         if not client_id or not client_secret:
-            self.update_log("❌ 設定タブで Strava Client ID と Client Secret を入力してください。")
-            self.after(0, lambda: self.close_button.configure(state="normal"))
-            return
+            self.update_log("Strava の認証情報が設定されていません。認証ダイアログを開きます...")
+            auth_result: queue.Queue[bool] = queue.Queue()
+
+            def _show_auth_dialog() -> None:
+                dialog = StravaAuthDialog(self)
+                dialog.wait_window()
+                auth_result.put(dialog.auth_success)
+
+            self.after(0, _show_auth_dialog)
+            if not auth_result.get():
+                self.update_log("❌ 認証がキャンセルされました。")
+                self.after(0, lambda: self.close_button.configure(state="normal"))
+                return
+
+            settings = SettingsManager.load()
+            client_id = settings.get("strava_client_id", "").strip()
+            client_secret = settings.get("strava_client_secret", "").strip()
 
         if self.selected_dates:
             target_dates = self.selected_dates
@@ -3542,29 +3657,14 @@ class MainApp(ctk.CTk):
         ctk.CTkLabel(
             scrollable_frame,
             text=(
-                "Strava API アプリを https://www.strava.com/settings/api で作成し、\n"
-                "取得した Client ID と Client Secret を入力してください。\n"
-                "初回ダウンロード時にブラウザで OAuth 認証が行われます。"
+                "認証トークン取得ボタンから Client ID・Client Secret を入力して OAuth 認証を行います。\n"
+                "認証情報はローカルに保存され、トークンの自動更新に使用されます。"
             ),
             font=("Yu Gothic UI", 12),
             text_color="gray",
             justify="left",
             wraplength=600,
         ).pack(pady=(0, 8), anchor="w", padx=40)
-
-        strava_id_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
-        strava_id_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(strava_id_frame, text="Client ID:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
-        self.strava_client_id_entry = ctk.CTkEntry(strava_id_frame, font=("Yu Gothic UI", 14), width=300)
-        self.strava_client_id_entry.insert(0, self.settings.get("strava_client_id", ""))
-        self.strava_client_id_entry.pack(side="left", padx=5)
-
-        strava_secret_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
-        strava_secret_frame.pack(pady=5, padx=40, fill="x")
-        ctk.CTkLabel(strava_secret_frame, text="Client Secret:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
-        self.strava_client_secret_entry = ctk.CTkEntry(strava_secret_frame, font=("Yu Gothic UI", 14), width=300, show="*")
-        self.strava_client_secret_entry.insert(0, self.settings.get("strava_client_secret", ""))
-        self.strava_client_secret_entry.pack(side="left", padx=5)
 
         # Stravaトークン取得/再認証ボタン
         strava_reset_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
@@ -3916,16 +4016,13 @@ class MainApp(ctk.CTk):
             )
 
     def _strava_reset_token(self) -> None:
-        """Stravaトークンファイルを削除し、次回認証を促します。"""
+        """Strava認証ダイアログを開き、OAuth認証を実行します。既存トークンは認証完了時に上書きされます。"""
         token_path = _get_strava_token_path()
         if token_path.exists():
             token_path.unlink()
+        dialog = StravaAuthDialog(self)
+        dialog.wait_window()
         self._update_strava_token_status()
-        if hasattr(self, "strava_token_status_label"):
-            self.strava_token_status_label.configure(
-                text="🗑️ トークンを削除しました。次回ダウンロード時に再認証されます。",
-                text_color="gray"
-            )
 
     def _garmin_login_test(self) -> None:
         """
@@ -4088,8 +4185,6 @@ class MainApp(ctk.CTk):
             "gpx_track_width": track_width_val,
             "map_max_points": map_max_points_val,
             "camera_timezone": camera_timezone,
-            "strava_client_id": self.strava_client_id_entry.get().strip(),
-            "strava_client_secret": self.strava_client_secret_entry.get().strip(),
         })
         
         # 設定を再読み込み
