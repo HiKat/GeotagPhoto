@@ -3078,9 +3078,12 @@ class MainApp(ctk.CTk):
         
         # マーカーを追加
         marker_count = len(self.photo_locations)
-        enable_click = marker_count <= 500  # 500件以下の場合のみクリックイベントを有効化
-        
-        for idx, location in enumerate(self.photo_locations):
+        max_points = int(self.settings.get("map_max_points", 1000))
+        display_locations = self.photo_locations[:max_points]
+        display_count = len(display_locations)
+        enable_click = display_count <= 500  # 500件以下の場合のみクリックイベントを有効化
+
+        for idx, location in enumerate(display_locations):
             marker = self.map_widget.set_marker(
                 location["lat"],
                 location["lon"],
@@ -3104,14 +3107,15 @@ class MainApp(ctk.CTk):
             self.map_widget.set_zoom(12)
         
         # 情報ラベル更新
+        base_text = f"{marker_count} 枚のうち {display_count} 枚描画（上限: {max_points} 件）"
         if enable_click:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカーをクリックしてサムネイルを表示・表示されない場合はリロード）",
+                text=f"{base_text}　マーカーをクリックしてサムネイルを表示（表示されない場合はリロード）",
                 text_color="#2FA84F"
             )
         else:
             self.map_info_label.configure(
-                text=f"{marker_count} 個の写真の位置を表示しています（マーカー数が多いためクリック無効）",
+                text=f"{base_text}　マーカー数が多いためクリック無効",
                 text_color="#E6A817"
             )
         
@@ -3741,7 +3745,37 @@ class MainApp(ctk.CTk):
         self.gpx_track_width_entry.insert(0, str(default_track_width))
         self.gpx_track_width_entry.pack(side="left", padx=5)
         ctk.CTkLabel(gpx_width_frame, text="(デフォルト: 3)", font=("Yu Gothic UI", 11), text_color="gray").pack(side="left", padx=5)
-        
+
+        # === マップ描画ポイント数設定 ===
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="マップ描画ポイント数",
+            font=("Yu Gothic UI", 20, "bold")
+        ).pack(pady=(30, 10))
+
+        ctk.CTkLabel(
+            scrollable_frame,
+            text="マップ上に描画する写真位置マーカーの最大数を設定します。マップの描画が重い場合は小さい値に変更してください。",
+            font=("Yu Gothic UI", 12),
+            text_color="gray",
+            wraplength=700,
+            justify="left"
+        ).pack(pady=(0, 10))
+
+        map_max_points_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        map_max_points_frame.pack(pady=5, padx=40, fill="x")
+        ctk.CTkLabel(map_max_points_frame, text="最大ポイント数:", font=("Yu Gothic UI", 14), width=LABEL_WIDTH, anchor="w").pack(side="left", padx=5)
+        self.map_max_points_entry = ctk.CTkEntry(map_max_points_frame, font=("Yu Gothic UI", 14), width=200)
+        default_map_max_points = self.settings.get("map_max_points", 1000)
+        self.map_max_points_entry.insert(0, str(default_map_max_points))
+        self.map_max_points_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(
+            map_max_points_frame,
+            text="(デフォルト: 1000　描画が重い場合は小さくしてください)",
+            font=("Yu Gothic UI", 11),
+            text_color="gray"
+        ).pack(side="left", padx=5)
+
         # === タイルサーバー設定 ===
         ctk.CTkLabel(
             scrollable_frame, 
@@ -3932,8 +3966,8 @@ class MainApp(ctk.CTk):
         tile_server_max_zoom = self.tile_server_max_zoom_entry.get().strip()
         gpx_track_color = self.gpx_track_color_entry.get().strip()
         gpx_track_width = self.gpx_track_width_entry.get().strip()
-        gpx_track_width = self.gpx_track_width_entry.get().strip()
         camera_timezone = self.camera_timezone_var.get().strip()
+        map_max_points = self.map_max_points_entry.get().strip()
         
         # 座標のバリデーション
         try:
@@ -4021,6 +4055,18 @@ class MainApp(ctk.CTk):
             )
             return
         
+        # マップ描画ポイント数のバリデーション
+        try:
+            map_max_points_val = int(map_max_points) if map_max_points else 1000
+            if map_max_points_val < 1:
+                raise ValueError("ポイント数が範囲外")
+        except ValueError:
+            self.settings_status_label.configure(
+                text="❌ マップ描画ポイント数は1以上の整数で入力してください",
+                text_color="red"
+            )
+            return
+
         # 変更前の設定を保持（マップ再生成判定用）
         old_cache_dir = self.settings.get("cache_dir", str(SettingsManager._get_default_dir()))
         old_tile_server_url = self.settings.get("tile_server_url", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
@@ -4040,6 +4086,7 @@ class MainApp(ctk.CTk):
             "tile_server_max_zoom": max_zoom_val,
             "gpx_track_color": gpx_track_color,
             "gpx_track_width": track_width_val,
+            "map_max_points": map_max_points_val,
             "camera_timezone": camera_timezone,
             "strava_client_id": self.strava_client_id_entry.get().strip(),
             "strava_client_secret": self.strava_client_secret_entry.get().strip(),
