@@ -68,143 +68,13 @@ import tkintermapview
 
 
 # -----------------------------
-# garminconnect ライブラリのパッチ
+# garminconnect ライブラリの診断ログ設定
 # -----------------------------
 
-def _apply_garminconnect_mfa_patch() -> None:
-    """
-    garminconnect v0.3.3 のバグ修正パッチ。
-
-    widget ログイン時に Garmin が 'GARMIN Authentication Application' という
-    タイトルのページを返すことがあるが、ライブラリは "MFA" という文字列しか
-    チェックしないため MFA フローに入らず「unexpected title」エラーになる。
-    このパッチにより "authentication application" / "garmin authentication"
-    タイトルも MFA として扱われるようになる。
-
-    将来 garminconnect 側で修正された場合はこの関数ごと削除してください。
-    """
-    try:
-        import random as _random
-        import re as _re
-        import time as _time
-
-        import garminconnect.client as _gc
-
-        _CSRF_RE = _gc._CSRF_RE
-        _TITLE_RE = _gc._TITLE_RE
-        _MFARequired = _gc._MFARequired
-        _GarminConnectTooManyRequestsError = _gc.GarminConnectTooManyRequestsError
-        _GarminConnectConnectionError = _gc.GarminConnectConnectionError
-        _GarminConnectAuthenticationError = _gc.GarminConnectAuthenticationError
-        _WIDGET_DELAY_MIN_S = _gc.WIDGET_DELAY_MIN_S
-        _WIDGET_DELAY_MAX_S = _gc.WIDGET_DELAY_MAX_S
-        _HAS_CFFI = _gc.HAS_CFFI
-        _cffi_requests = getattr(_gc, "cffi_requests", None)
-        _logger = logging.getLogger("garminconnect.client")
-
-        def _patched_widget_web_login(self, email: str, password: str) -> None:
-            if not _HAS_CFFI or _cffi_requests is None:
-                raise _GarminConnectConnectionError("curl_cffi not available")
-            sess = _cffi_requests.Session(impersonate="chrome", timeout=30)
-            sso_base = f"{self._sso}/sso"
-            sso_embed = f"{sso_base}/embed"
-            embed_params = {
-                "id": "gauth-widget",
-                "embedWidget": "true",
-                "gauthHost": sso_base,
-            }
-            signin_params = {
-                **embed_params,
-                "gauthHost": sso_embed,
-                "service": sso_embed,
-                "source": sso_embed,
-                "redirectAfterAccountLoginUrl": sso_embed,
-                "redirectAfterAccountCreationUrl": sso_embed,
-            }
-
-            r = sess.get(sso_embed, params=embed_params)
-            if r.status_code == 429:
-                raise _GarminConnectTooManyRequestsError("Widget embed GET returned 429")
-            if not r.ok:
-                raise _GarminConnectConnectionError(f"Widget embed returned {r.status_code}")
-
-            r = sess.get(
-                f"{sso_base}/signin",
-                params=signin_params,
-                headers={"Referer": sso_embed},
-            )
-            if r.status_code == 429:
-                raise _GarminConnectTooManyRequestsError("Widget signin GET returned 429")
-
-            csrf_match = _CSRF_RE.search(r.text)
-            if not csrf_match:
-                raise _GarminConnectConnectionError("Widget login: missing CSRF token")
-
-            delay_s = _random.uniform(_WIDGET_DELAY_MIN_S, _WIDGET_DELAY_MAX_S)  # noqa: S311
-            _logger.debug("Widget login: waiting %.0fs anti-WAF delay...", delay_s)
-            _time.sleep(delay_s)
-
-            r = sess.post(
-                f"{sso_base}/signin",
-                params=signin_params,
-                headers={"Referer": r.url},
-                data={
-                    "username": email,
-                    "password": password,
-                    "embed": "true",
-                    "_csrf": csrf_match.group(1),
-                },
-                timeout=30,
-            )
-
-            if r.status_code == 429:
-                raise _GarminConnectTooManyRequestsError("Widget signin POST returned 429")
-
-            title_match = _TITLE_RE.search(r.text)
-            title = title_match.group(1) if title_match else ""
-            title_lower = title.lower()
-
-            if any(
-                hint in title_lower
-                for hint in ("bad gateway", "service unavailable", "cloudflare", "502", "503")
-            ):
-                raise _GarminConnectConnectionError(f"Widget login: server error '{title}'")
-
-            if any(
-                hint in title_lower
-                for hint in ("locked", "invalid", "incorrect", "account error")
-            ):
-                raise _GarminConnectAuthenticationError(
-                    f"Widget authentication failed: '{title}'"
-                )
-
-            # 修正箇所: "GARMIN Authentication Application" タイトルも MFA として扱う
-            if "MFA" in title or "authentication application" in title_lower or "garmin authentication" in title_lower:
-                self._mfa_session = sess
-                self._mfa_login_params = signin_params
-                self._mfa_post_headers = {"Referer": r.url}
-                self._mfa_flow = "widget"
-                self._widget_last_resp = r
-                raise _MFARequired()
-
-            if title != "Success":
-                raise _GarminConnectConnectionError(
-                    f"Widget login: unexpected title '{title}'"
-                )
-
-            ticket_match = _re.search(r'embed\?ticket=([^"]+)"', r.text)
-            if not ticket_match:
-                raise _GarminConnectConnectionError("Widget login: missing service ticket")
-
-            self._establish_session(ticket_match.group(1), sess=sess, service_url=sso_embed)
-
-        _gc.Client._widget_web_login = _patched_widget_web_login
-
-    except Exception:
-        pass  # パッチ適用失敗時はそのままライブラリのデフォルト動作を使用
-
-
-_apply_garminconnect_mfa_patch()
+# garminconnect.client の DEBUG ログを Python の root logger に流す。
+# これにより portal/widget 各戦略の詳細がUIのログに表示され、
+# ログイン失敗時の原因特定が容易になる。
+logging.getLogger("garminconnect.client").setLevel(logging.DEBUG)
 
 
 # -----------------------------
@@ -826,7 +696,7 @@ def _garmin_login_with_retry(
     log_handler = None
     if log_callback:
         log_handler = _GarminLogHandler(log_callback)
-        log_handler.setLevel(logging.WARNING)
+        log_handler.setLevel(logging.DEBUG)
         garmin_logger.addHandler(log_handler)
         garmin_logger.setLevel(logging.DEBUG)
 
