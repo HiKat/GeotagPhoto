@@ -100,7 +100,14 @@ def find_exiftool() -> str:
     if local_exe.exists():
         return str(local_exe)
 
-    # PATHにある場合は、"exiftool"で実行可能なためそのまま返します。
+    # PATHにある場合は、shutil.whichでフルパスを取得して返します。
+    # subprocess.CREATE_NO_WINDOW 使用時にPATH解決が失敗するケースを回避するため、
+    # 常にフルパスを返します。
+    full_path = shutil.which("exiftool")
+    if full_path:
+        return full_path
+
+    # 見つからない場合は "exiftool" を返す（FileNotFoundError を呼び出し元に委譲）
     return "exiftool"
 
 
