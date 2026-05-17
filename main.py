@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import traceback as _traceback_early
 import xml.etree.ElementTree as ET
 
@@ -2396,6 +2397,7 @@ class ProcessingPopup(ctk.CTkToplevel):
             except Exception as error:
                 msg = f"ExifTool エラー: {error}"
                 self.log_message(msg, "ERROR")
+                self.log_message(f"[診断] トレースバック:\n{traceback.format_exc()}", "ERROR")
                 self.show_error_banner(msg)
                 self.is_processing = False
                 self.after(0, lambda: self.close_button.configure(state="normal"))
@@ -2520,7 +2522,9 @@ class ProcessingPopup(ctk.CTkToplevel):
         if not target_files:
             self.log_message("分類対象のファイルがありません", "WARNING")
             return photo_dates
-        
+
+        self.log_message(f"[診断] 分類対象 {len(target_files)} 個のファイルをExifToolで解析中...")
+
         try:
             result = _run_exiftool_argfile(
                 exiftool_path,
@@ -2529,6 +2533,8 @@ class ProcessingPopup(ctk.CTkToplevel):
             )
             if not result.stdout or result.stdout.strip() == "":
                 self.log_message("ExifToolからデータを取得できませんでした", "WARNING")
+                if result.stderr:
+                    self.log_message(f"[診断] ExifTool stderr: {result.stderr.strip()[:500]}", "WARNING")
                 return photo_dates
             
             data = json.loads(result.stdout)
@@ -2542,8 +2548,12 @@ class ProcessingPopup(ctk.CTkToplevel):
                     "gps_lat": item.get("GPSLatitude"),
                     "gps_lon": item.get("GPSLongitude")
                 }
+        except subprocess.CalledProcessError as e:
+            self.log_message(f"ExifTool実行エラー (exit={e.returncode}): {e.stderr.strip() if e.stderr else ''}", "ERROR")
+            return photo_dates
         except Exception as e:
             self.log_message(f"ExifTool実行エラー: {e}", "ERROR")
+            self.log_message(f"[診断] トレースバック:\n{traceback.format_exc()}", "ERROR")
             return photo_dates
         
         # ファイルを分類
