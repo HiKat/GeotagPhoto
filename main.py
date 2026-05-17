@@ -2188,12 +2188,26 @@ class ProcessingPopup(ctk.CTkToplevel):
         self.progress_bar.set(0)
         self.progress_bar.pack(pady=10, padx=20)
 
+        # エラーバナー（通常時は透明で非表示、エラー発生時に赤く強調表示されます）
+        self.error_banner = ctk.CTkLabel(
+            self, text="",
+            fg_color="transparent",
+            font=("Yu Gothic UI", 12, "bold"),
+            text_color="white",
+            wraplength=900,
+            justify="left",
+        )
+        self.error_banner.pack(pady=0, padx=20, fill="x")
+
         # コンソールログ（タイトルラベルは処理完了後に「処理ログ（完了）」へ変更します）
         self.log_title_label = ctk.CTkLabel(self, text="処理ログ:", font=("Yu Gothic UI", 12, "bold"))
         self.log_title_label.pack(pady=(10, 5), anchor="w", padx=20)
         # fill="both" + expand=True で残領域を使い切ることで、閉じるボタンが隠れなくなります。
         self.console_log = ctk.CTkTextbox(self, font=("Consolas", 10))
         self.console_log.pack(pady=5, padx=20, fill="both", expand=True)
+        # ログ色付け用のタグを設定します。
+        self.console_log._textbox.tag_configure("error_tag", foreground="#ff6666")
+        self.console_log._textbox.tag_configure("warning_tag", foreground="#ffaa44")
 
         # 閉じるボタン（最初は無効・処理完了後に有効化）
         # command は close_popup に設定し、閉じると同時にGPX軌跡を再描画します。
@@ -2236,17 +2250,39 @@ class ProcessingPopup(ctk.CTkToplevel):
         self.is_processing = True
         threading.Thread(target=self.process_logic, daemon=True).start()
     
+    def show_error_banner(self, message: str) -> None:
+        """
+        エラーバナーを赤く強調表示します。
+        """
+        def _show():
+            self.error_banner.configure(
+                text=f"⚠ エラー: {message}",
+                fg_color="#8b0000",
+                corner_radius=6,
+                text_color="#ffcccc",
+            )
+            self.error_banner.pack(pady=(6, 4), padx=20, fill="x")
+        self.after(0, _show)
+
     def log_message(self, message: str, level: str = "INFO") -> None:
         """
         コンソールログにメッセージを追加します。
+        ERROR は赤、WARNING はオレンジで色付けされます。
         """
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_line = f"[{timestamp}] {level}: {message}\n"
-        
+
         def update_log():
+            tb = self.console_log._textbox
+            start = tb.index("end-1c")
             self.console_log.insert("end", log_line)
+            end = tb.index("end-1c")
+            if level == "ERROR":
+                tb.tag_add("error_tag", start, end)
+            elif level == "WARNING":
+                tb.tag_add("warning_tag", start, end)
             self.console_log.see("end")
-        
+
         self.after(0, update_log)
 
     def process_logic(self) -> None:
@@ -2337,13 +2373,30 @@ class ProcessingPopup(ctk.CTkToplevel):
                     self.log_message(f"ExifToolジオタギング完了: {tagged_count}個に付与、{skipped_count}個はスキップ（既にGPS情報あり）")
                 else:
                     self.log_message(f"ExifToolジオタギング完了: {tagged_count}個に付与")
+            except FileNotFoundError:
+                msg = (
+                    f"ExifTool が見つかりません。"
+                    f"exiftool.exe をアプリと同じフォルダに置くか、"
+                    f"PATH に追加してください。（検索パス: {exiftool_path}）"
+                )
+                self.log_message(msg, "ERROR")
+                self.show_error_banner(msg)
+                self.is_processing = False
+                self.after(0, lambda: self.close_button.configure(state="normal"))
+                return
             except subprocess.CalledProcessError as error:
-                self.log_message(f"ExifToolの実行に失敗しました: {error}", "ERROR")
+                msg = f"ExifTool の実行に失敗しました (終了コード {error.returncode})"
+                self.log_message(msg, "ERROR")
+                if error.stderr:
+                    self.log_message(error.stderr.strip(), "ERROR")
+                self.show_error_banner(msg)
                 self.is_processing = False
                 self.after(0, lambda: self.close_button.configure(state="normal"))
                 return
             except Exception as error:
-                self.log_message(f"ExifToolエラー: {error}", "ERROR")
+                msg = f"ExifTool エラー: {error}"
+                self.log_message(msg, "ERROR")
+                self.show_error_banner(msg)
                 self.is_processing = False
                 self.after(0, lambda: self.close_button.configure(state="normal"))
                 return
