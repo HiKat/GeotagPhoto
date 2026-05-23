@@ -40,7 +40,6 @@ config.json
 # 配布物はリポジトリから除外
 exiftool.exe
 *.log
-.github/copilot-instructions.md
 SPEC.md
 # テスト配下は全て追跡対象外（クレデンシャル含む可能性あり）
 test/
@@ -59,9 +58,6 @@ release_notes.md
 
 # リリースビルド成果物
 releases/
-
-# Copilotスキル（ローカル開発用）
-.github/skills/
 
 # キャッシュディレクトリ（ユーザー環境依存）
 .geotagphoto_cache/
