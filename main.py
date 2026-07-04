@@ -2859,6 +2859,8 @@ class MainApp(ctk.CTk):
         # メインタブ
         self.tabview.add("メイン")
         main_tab = self.tabview.tab("メイン")
+        main_scrollable_frame = ctk.CTkScrollableFrame(main_tab, fg_color="transparent")
+        main_scrollable_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         # 設定タブ
         self.tabview.add("設定")
@@ -2875,25 +2877,25 @@ class MainApp(ctk.CTk):
         # メインタブのUI構築
         # 画像取り込み設定ラベル
         ctk.CTkLabel(
-            main_tab,
+            main_scrollable_frame,
             text="画像取り込み設定",
             font=("Yu Gothic UI", 20, "bold")
         ).pack(pady=(20, 10))
         
         self.source_entry = self.create_dir_selector(
-            main_tab, "読み込む画像のディレクトリ", "img_src", "① 選択"
+            main_scrollable_frame, "読み込む画像のディレクトリ", "img_src", "① 選択"
         )
         self.dest_entry = self.create_dir_selector(
-            main_tab, "画像の取り込みディレクトリ", "img_dest", "② 選択"
+            main_scrollable_frame, "画像の取り込みディレクトリ", "img_dest", "② 選択"
         )
         self.gpx_entry = self.create_dir_selector(
-            main_tab, "位置情報ファイルの保存先", "gpx_dir", "③ 選択"
+            main_scrollable_frame, "位置情報ファイルの保存先", "gpx_dir", "③ 選択"
         )
 
-        self.setup_gpx_download_ui(main_tab)
+        self.setup_gpx_download_ui(main_scrollable_frame)
 
         ctk.CTkButton(
-            main_tab,
+            main_scrollable_frame,
             text="⑥ 取り込み",
             fg_color="green",
             command=self.open_processing_popup,
@@ -3005,8 +3007,11 @@ class MainApp(ctk.CTk):
         地図UIをセットアップします。
         パフォーマンス最適化を含みます。
         """
+        scrollable_frame = ctk.CTkScrollableFrame(parent_frame, fg_color="transparent")
+        scrollable_frame.pack(fill="both", expand=True)
+
         # タイトル
-        ctk.CTkLabel(parent_frame, text="撮影位置情報", font=("Yu Gothic UI", 18, "bold")).pack(pady=(10, 5))
+        ctk.CTkLabel(scrollable_frame, text="撮影位置情報", font=("Yu Gothic UI", 18, "bold")).pack(pady=(10, 5))
         
         # キャッシュディレクトリを設定から取得
         cache_dir_str = self.settings.get("cache_dir", str(Path.home() / ".geotagphoto_cache"))
@@ -3015,7 +3020,7 @@ class MainApp(ctk.CTk):
         
         # 地図ウィジェット（OpenStreetMap使用、キャッシュ有効化）
         self.map_widget = tkintermapview.TkinterMapView(
-            parent_frame, 
+            scrollable_frame,
             width=600, 
             height=600,
             database_path=str(cache_dir / "map_tiles.db")
@@ -3036,7 +3041,7 @@ class MainApp(ctk.CTk):
         
         # 情報ラベル
         self.map_info_label = ctk.CTkLabel(
-            parent_frame, 
+            scrollable_frame,
             text="「取り込み」を実行すると、ジオタグが付与された写真の位置がマップに表示されます（テスト中）",
             font=("Yu Gothic UI", 12),
             text_color="gray"
@@ -3044,7 +3049,7 @@ class MainApp(ctk.CTk):
         self.map_info_label.pack(pady=5)
         
         # マップ更新ボタン
-        refresh_button_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        refresh_button_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
         refresh_button_frame.pack(pady=5)
         
         ctk.CTkButton(
