@@ -2293,6 +2293,49 @@ class ProcessingPopup(ctk.CTkToplevel):
 
         self.after(0, update_log)
 
+    def verify_destination_writable(self, dest_dir: Path) -> bool:
+        """
+        取り込み先フォルダに実際に書き込めるか確認します。
+        Windows Defender のコントロールされたフォルダー アクセスなどで
+        Pictures 配下への書き込みがブロックされる場合、ここで検出します。
+        """
+        test_path = dest_dir / f".__geotagphoto_write_test_{os.getpid()}_{threading.get_ident()}.tmp"
+        try:
+            with open(test_path, "wb") as file:
+                file.write(b"GeotagPhoto write test\n")
+                file.flush()
+                os.fsync(file.fileno())
+            test_path.unlink()
+            return True
+        except Exception as e:
+            try:
+                if test_path.exists():
+                    test_path.unlink()
+            except Exception:
+                pass
+
+            self.log_message("取り込み先フォルダに書き込めません", "ERROR")
+            self.log_message(f"取り込み先: {dest_dir}", "ERROR")
+            self.log_message(f"診断: 一時ファイル作成に失敗しました: {test_path} - {e}", "ERROR")
+            self.log_message(
+                "Windows Defender の「コントロールされたフォルダー アクセス」により、"
+                "Pictures / Documents / Desktop などの保護フォルダ配下への書き込みが"
+                "ブロックされている可能性があります。",
+                "ERROR",
+            )
+            self.log_message(
+                "対処: GeotagPhoto.exe（開発中は python.exe）と exiftool.exe を許可するか、"
+                "取り込み先を保護対象外のフォルダに変更してください。",
+                "ERROR",
+            )
+            self.show_error_banner(
+                "取り込み先フォルダに書き込めません。Windows Defender の保護機能により"
+                "ブロックされている可能性があります。GeotagPhoto.exe / python.exe と "
+                "exiftool.exe を許可するか、取り込み先を別フォルダに変更してください。"
+            )
+            self.update_progress("取り込み先に書き込めません", 0, 0)
+            return False
+
     def process_logic(self) -> None:
         """
         実際の取り込み処理を実行します。
@@ -2311,7 +2354,23 @@ class ProcessingPopup(ctk.CTkToplevel):
                 return
             if not dest_dir.exists():
                 self.log_message(f"取り込み先ディレクトリを作成: {dest_dir}")
-                dest_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    self.log_message("取り込み先ディレクトリを作成できません", "ERROR")
+                    self.log_message(f"取り込み先: {dest_dir}", "ERROR")
+                    self.log_message(f"診断: {e}", "ERROR")
+                    self.show_error_banner(
+                        "取り込み先ディレクトリを作成できません。Windows Defender の保護機能や"
+                        "アクセス権限によりブロックされている可能性があります。"
+                    )
+                    self.is_processing = False
+                    self.after(0, lambda: self.close_button.configure(state="normal"))
+                    return
+            if not self.verify_destination_writable(dest_dir):
+                self.is_processing = False
+                self.after(0, lambda: self.close_button.configure(state="normal"))
+                return
             if not gpx_dir.exists():
                 self.log_message("位置情報ファイルの保存先が存在しません", "ERROR")
                 self.is_processing = False
@@ -2341,16 +2400,23 @@ class ProcessingPopup(ctk.CTkToplevel):
             self.log_message(f"{len(files_to_copy)} 個のファイルを発見しました")
             self.update_progress("コピー中...", 0, 0)
 
+            copied_count = 0
+            failed_count = 0
             for index, file_path in enumerate(files_to_copy, start=1):
                 progress = (index / len(files_to_copy)) * 0.3  # 0-30%
                 percentage = int(progress * 100)
                 self.update_progress(f"コピー中... ({index}/{len(files_to_copy)})", progress, percentage)
                 try:
                     shutil.copy2(file_path, dest_dir / file_path.name)
+                    copied_count += 1
                 except Exception as e:
-                    self.log_message(f"コピー失敗: {file_path.name} - {e}", "WARNING")
+                    failed_count += 1
+                    self.log_message(f"コピー失敗: {file_path} -> {dest_dir / file_path.name} - {e}", "WARNING")
 
-            self.log_message(f"コピー完了: {len(files_to_copy)} 個のファイル")
+            if failed_count:
+                self.log_message(f"コピー完了: 成功={copied_count} 個, 失敗={failed_count} 個", "WARNING")
+            else:
+                self.log_message(f"コピー完了: {copied_count} 個のファイル")
 
             # 2. GPXまたはTCXファイルを取得します。
             self.log_message("GPX/TCXファイルを検索中...")
@@ -3019,13 +3085,24 @@ class MainApp(ctk.CTk):
         cache_dir.mkdir(exist_ok=True)
         
         # 地図ウィジェット（OpenStreetMap使用、キャッシュ有効化）
-        self.map_widget = tkintermapview.TkinterMapView(
+        map_container_bg = "#2B2B2B" if ctk.get_appearance_mode() == "Dark" else "#DBDBDB"
+        map_container = tk.Frame(
             scrollable_frame,
-            width=600, 
+            width=600,
+            height=600,
+            bg=map_container_bg,
+            highlightthickness=0,
+        )
+        map_container.pack(fill="both", expand=True, padx=10, pady=10)
+        map_container.pack_propagate(False)
+
+        self.map_widget = tkintermapview.TkinterMapView(
+            map_container,
+            width=600,
             height=600,
             database_path=str(cache_dir / "map_tiles.db")
         )
-        self.map_widget.pack(fill="both", expand=True, padx=10, pady=10)
+        self.map_widget.pack(fill="both", expand=True)
         
         # タイルサーバーを明示的に設定
         tile_server_url = self.settings.get("tile_server_url", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
