@@ -128,6 +128,30 @@ def _tz_name_to_offset(tz_name: str) -> str:
         return ""
 
 
+def check_directory_writable(directory: Path) -> Tuple[bool, Optional[Path], Optional[Exception]]:
+    """
+    指定ディレクトリに実際に書き込めるかを一時ファイルで確認します。
+    Windows Defender のコントロールされたフォルダー アクセスなどで
+    書き込みがブロックされる場合、ここで検出できます。
+    """
+    test_path = directory / f".__geotagphoto_write_test_{os.getpid()}_{threading.get_ident()}.tmp"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(test_path, "wb") as file:
+            file.write(b"GeotagPhoto write test\n")
+            file.flush()
+            os.fsync(file.fileno())
+        test_path.unlink()
+        return True, test_path, None
+    except Exception as error:
+        try:
+            if test_path.exists():
+                test_path.unlink()
+        except Exception:
+            pass
+        return False, test_path, error
+
+
 def list_gpx_or_tcx_files(gpx_dir: Path) -> List[Path]:
     """
     GPXまたはTCXファイルを指定フォルダから取得します。
@@ -1801,6 +1825,11 @@ class DownloadLogPopup(ctk.CTkToplevel):
             self.after(0, lambda: self.close_button.configure(state="normal"))
             return
 
+        gpx_dir_path = Path(gpx_dir)
+        if not self.verify_gpx_directory_writable(gpx_dir_path):
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+            return
+
         # トークンキャッシュの存在を確認します。
         tokenstore_dir = _get_garmin_tokenstore_dir()
         token_file = tokenstore_dir / "garmin_tokens.json"
@@ -1824,7 +1853,7 @@ class DownloadLogPopup(ctk.CTkToplevel):
         download_format = settings.get("activity_download_format", "gpx")
         
         # ダウンロード処理を実行します。
-        self.download_worker(target_dates, Path(gpx_dir), download_format)
+        self.download_worker(target_dates, gpx_dir_path, download_format)
 
     def _show_login_then_download(self, gpx_dir: str, settings: dict) -> None:
         """ログインポップアップを表示し、成功後にダウンロードを開始します。"""
@@ -1891,6 +1920,9 @@ class DownloadLogPopup(ctk.CTkToplevel):
         fmt_label = "GPX" if download_format == "gpx" else "TCX"
         retrying = False
         try:
+            if not self.verify_gpx_directory_writable(gpx_dir):
+                return
+
             self.update_log(f"ダウンロード開始...（形式: {fmt_label}）")
             self.update_log("※ 二段階認証を設定している場合、認証コード入力のポップアップが表示されるまでしばらくお待ちください。")
             downloaded_files = download_garmin_activities_gpx(
@@ -1945,6 +1977,26 @@ class DownloadLogPopup(ctk.CTkToplevel):
             self.update_log("━" * 40)
             self.update_log("❌ ダウンロードに失敗しました。")
             self.after(0, lambda: self.close_button.configure(state="normal"))
+
+    def verify_gpx_directory_writable(self, gpx_dir: Path) -> bool:
+        """GPX/TCX保存先に実際に書き込めるか確認します。"""
+        ok, test_path, error = check_directory_writable(gpx_dir)
+        if ok:
+            return True
+
+        self.update_log("❌ GPX/TCX保存先フォルダに書き込めません。")
+        self.update_log(f"保存先: {gpx_dir}")
+        self.update_log(f"診断: 一時ファイル作成に失敗しました: {test_path} - {error}")
+        self.update_log(
+            "Windows Defender の「コントロールされたフォルダー アクセス」により、"
+            "Documents / Pictures / Desktop などの保護フォルダ配下への書き込みが"
+            "ブロックされている可能性があります。"
+        )
+        self.update_log(
+            "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
+            "GPX/TCX保存先を保護対象外のフォルダに変更してください。"
+        )
+        return False
 
     def update_log(self, message: str) -> None:
         """
@@ -2105,6 +2157,11 @@ class StravaDownloadPopup(ctk.CTkToplevel):
             self.after(0, lambda: self.close_button.configure(state="normal"))
             return
 
+        gpx_dir_path = Path(gpx_dir)
+        if not self.verify_gpx_directory_writable(gpx_dir_path):
+            self.after(0, lambda: self.close_button.configure(state="normal"))
+            return
+
         client_id = settings.get("strava_client_id", "").strip()
         client_secret = settings.get("strava_client_secret", "").strip()
         if not client_id or not client_secret:
@@ -2136,9 +2193,12 @@ class StravaDownloadPopup(ctk.CTkToplevel):
                 current_date += timedelta(days=1)
 
         try:
+            if not self.verify_gpx_directory_writable(gpx_dir_path):
+                return
+
             downloaded_files = download_strava_activities(
                 target_dates=target_dates,
-                output_dir=Path(gpx_dir),
+                output_dir=gpx_dir_path,
                 log_callback=self.update_log,
                 client_id=client_id,
                 client_secret=client_secret,
@@ -2152,6 +2212,26 @@ class StravaDownloadPopup(ctk.CTkToplevel):
             self.update_log(f"❌ ダウンロード中にエラーが発生しました: {e}")
         finally:
             self.after(0, lambda: self.close_button.configure(state="normal"))
+
+    def verify_gpx_directory_writable(self, gpx_dir: Path) -> bool:
+        """GPX保存先に実際に書き込めるか確認します。"""
+        ok, test_path, error = check_directory_writable(gpx_dir)
+        if ok:
+            return True
+
+        self.update_log("❌ GPX保存先フォルダに書き込めません。")
+        self.update_log(f"保存先: {gpx_dir}")
+        self.update_log(f"診断: 一時ファイル作成に失敗しました: {test_path} - {error}")
+        self.update_log(
+            "Windows Defender の「コントロールされたフォルダー アクセス」により、"
+            "Documents / Pictures / Desktop などの保護フォルダ配下への書き込みが"
+            "ブロックされている可能性があります。"
+        )
+        self.update_log(
+            "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
+            "GPX保存先を保護対象外のフォルダに変更してください。"
+        )
+        return False
 
     def update_log(self, message: str) -> None:
         """ログを表示します。"""
@@ -2299,42 +2379,31 @@ class ProcessingPopup(ctk.CTkToplevel):
         Windows Defender のコントロールされたフォルダー アクセスなどで
         Pictures 配下への書き込みがブロックされる場合、ここで検出します。
         """
-        test_path = dest_dir / f".__geotagphoto_write_test_{os.getpid()}_{threading.get_ident()}.tmp"
-        try:
-            with open(test_path, "wb") as file:
-                file.write(b"GeotagPhoto write test\n")
-                file.flush()
-                os.fsync(file.fileno())
-            test_path.unlink()
+        ok, test_path, error = check_directory_writable(dest_dir)
+        if ok:
             return True
-        except Exception as e:
-            try:
-                if test_path.exists():
-                    test_path.unlink()
-            except Exception:
-                pass
 
-            self.log_message("取り込み先フォルダに書き込めません", "ERROR")
-            self.log_message(f"取り込み先: {dest_dir}", "ERROR")
-            self.log_message(f"診断: 一時ファイル作成に失敗しました: {test_path} - {e}", "ERROR")
-            self.log_message(
-                "Windows Defender の「コントロールされたフォルダー アクセス」により、"
-                "Pictures / Documents / Desktop などの保護フォルダ配下への書き込みが"
-                "ブロックされている可能性があります。",
-                "ERROR",
-            )
-            self.log_message(
-                "対処: GeotagPhoto.exe（開発中は python.exe）と exiftool.exe を許可するか、"
-                "取り込み先を保護対象外のフォルダに変更してください。",
-                "ERROR",
-            )
-            self.show_error_banner(
-                "取り込み先フォルダに書き込めません。Windows Defender の保護機能により"
-                "ブロックされている可能性があります。GeotagPhoto.exe / python.exe と "
-                "exiftool.exe を許可するか、取り込み先を別フォルダに変更してください。"
-            )
-            self.update_progress("取り込み先に書き込めません", 0, 0)
-            return False
+        self.log_message("取り込み先フォルダに書き込めません", "ERROR")
+        self.log_message(f"取り込み先: {dest_dir}", "ERROR")
+        self.log_message(f"診断: 一時ファイル作成に失敗しました: {test_path} - {error}", "ERROR")
+        self.log_message(
+            "Windows Defender の「コントロールされたフォルダー アクセス」により、"
+            "Pictures / Documents / Desktop などの保護フォルダ配下への書き込みが"
+            "ブロックされている可能性があります。",
+            "ERROR",
+        )
+        self.log_message(
+            "対処: GeotagPhoto.exe（開発中は python.exe）と exiftool.exe を許可するか、"
+            "取り込み先を保護対象外のフォルダに変更してください。",
+            "ERROR",
+        )
+        self.show_error_banner(
+            "取り込み先フォルダに書き込めません。Windows Defender の保護機能により"
+            "ブロックされている可能性があります。GeotagPhoto.exe / python.exe と "
+            "exiftool.exe を許可するか、取り込み先を別フォルダに変更してください。"
+        )
+        self.update_progress("取り込み先に書き込めません", 0, 0)
+        return False
 
     def process_logic(self) -> None:
         """

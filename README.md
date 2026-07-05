@@ -120,9 +120,11 @@ Windows Defender のランサムウェア対策機能により、`Pictures`、`D
 
 この場合、取り込み時に `WinError 2: 指定されたファイルが見つかりません` や「取り込み先フォルダに書き込めません」と表示されることがあります。コピー元のSDカードや外付けドライブがマウントされていても、取り込み先への書き込みがブロックされている可能性があります。
 
+GPX/TCXをGarmin ConnectやStravaからダウンロードする場合も同様です。`Documents\gpx` などをGPX/TCX保存先にしていると、「GPX保存先フォルダに書き込めません」と表示される場合があります。
+
 対処方法:
 
-- 取り込み先を保護対象外のフォルダに変更する（例: `C:\GeotagPhoto_import`、外付けドライブ上の作業フォルダなど）
+- 取り込み先やGPX/TCX保存先を保護対象外のフォルダに変更する（例: `C:\GeotagPhoto\import`、`C:\GeotagPhoto\gpx`、外付けドライブ上の作業フォルダなど）
 - Windows セキュリティで許可アプリに追加する
   - 配布版: `GeotagPhoto.exe` と `exiftool.exe`
   - ソース実行時: 使用している `python.exe` と `exiftool.exe`
