@@ -83,6 +83,18 @@ logging.getLogger("garminconnect.client").setLevel(logging.DEBUG)
 # -----------------------------
 
 
+def get_app_base_dir() -> Path:
+    """アプリケーション(EXE/スクリプト)の配置ディレクトリを返します。"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_static_asset_path(*parts: str) -> Path:
+    """static配下のアセットパスを返します。"""
+    return get_app_base_dir() / "static" / Path(*parts)
+
+
 def find_exiftool() -> str:
     """
     ExifToolの実行ファイルを探します。
@@ -93,7 +105,7 @@ def find_exiftool() -> str:
     どちらかで見つかったパスを返します。
     """
     # このPythonファイルがあるフォルダを取得します。
-    current_dir = Path(__file__).resolve().parent
+    current_dir = get_app_base_dir()
 
     # 同じフォルダにexiftool.exeがあるかを確認します。
     local_exe = current_dir / "exiftool.exe"
@@ -534,9 +546,7 @@ class SettingsManager:
     @classmethod
     def _get_app_dir(cls) -> Path:
         """アプリケーション(EXE/スクリプト)の配置ディレクトリを返します。"""
-        if getattr(sys, 'frozen', False):
-            return Path(sys.executable).parent
-        return Path(__file__).resolve().parent
+        return get_app_base_dir()
 
     @classmethod
     def get_config_path(cls) -> Path:
@@ -2936,6 +2946,8 @@ class MainApp(ctk.CTk):
         super().__init__()
         self.title("GeotagPhoto")
         self.geometry("1500x900")
+        self._app_icon_photo = None
+        self.configure_app_icon()
 
         # 設定読み込み
         self.settings = SettingsManager.load()
@@ -2974,6 +2986,23 @@ class MainApp(ctk.CTk):
         self.matching_gpx_files: List[Path] = []  # 撮影日時に該当するGPXファイルリスト
 
         self.setup_ui()
+
+    def configure_app_icon(self) -> None:
+        """
+        Windowsのタイトルバー、タスクバー、Toplevel既定アイコンを設定します。
+        """
+        icon_ico_path = get_static_asset_path("logo", "app.ico")
+        icon_png_path = get_static_asset_path("logo", "app.png")
+
+        if not icon_ico_path.exists():
+            raise FileNotFoundError(f"アプリアイコンが見つかりません: {icon_ico_path}")
+        if not icon_png_path.exists():
+            raise FileNotFoundError(f"アプリアイコン画像が見つかりません: {icon_png_path}")
+
+        self.iconbitmap(str(icon_ico_path))
+        with Image.open(icon_png_path) as icon_image:
+            self._app_icon_photo = ImageTk.PhotoImage(icon_image.copy())
+        self.iconphoto(True, self._app_icon_photo)
 
     def setup_ui(self) -> None:
         """
@@ -4618,8 +4647,8 @@ class MainApp(ctk.CTk):
         
         # ロゴ画像をクリックするとXプロフィールへジャンプ
         # light_image: ライトモード用（黒ロゴ）、dark_image: ダークモード用（白ロゴ）
-        _logo_black_path = Path(__file__).parent / "static" / "logo" / "logo-black.png"
-        _logo_white_path = Path(__file__).parent / "static" / "logo" / "logo-white.png"
+        _logo_black_path = get_static_asset_path("logo", "logo-black.png")
+        _logo_white_path = get_static_asset_path("logo", "logo-white.png")
         _logo_img = ctk.CTkImage(
             light_image=Image.open(_logo_black_path),
             dark_image=Image.open(_logo_white_path),
@@ -4705,7 +4734,7 @@ if __name__ == "__main__":
 
     def _write_error_log(text: str) -> None:
         try:
-            log_path = pathlib.Path.home() / "GeotagPhoto_error.log"
+            log_path = Path.home() / "GeotagPhoto_error.log"
             log_path.write_text(text, encoding="utf-8")
         except Exception:
             pass

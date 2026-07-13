@@ -70,7 +70,7 @@ New-Item -ItemType Directory -Path "releases\v_debug-{LABEL}" -Force
   --windows-file-version="0.0.0.0" `
   --windows-product-version="0.0.0.0" `
   --windows-file-description="Photo geotagging tool using Garmin Connect GPX (debug build)" `
-  --windows-icon-from-ico=myenv/Lib/site-packages/customtkinter/assets/icons/CustomTkinter_icon_Windows.ico `
+  --windows-icon-from-ico=static/logo/app.ico `
   main.py
 ```
 

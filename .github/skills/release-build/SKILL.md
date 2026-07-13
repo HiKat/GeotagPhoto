@@ -149,7 +149,7 @@ New-Item -ItemType Directory -Path "releases\vX.Y.Z" -Force
   --windows-file-version="X.Y.Z.0" `
   --windows-product-version="X.Y.Z.0" `
   --windows-file-description="Photo geotagging tool using Garmin Connect GPX" `
-  --windows-icon-from-ico=myenv/Lib/site-packages/customtkinter/assets/icons/CustomTkinter_icon_Windows.ico `
+  --windows-icon-from-ico=static/logo/app.ico `
   main.py
 ```
 
