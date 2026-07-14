@@ -1,5 +1,9 @@
 # GeotagPhoto
 
+<p align="center">
+  <img src="static/logo/app.png" alt="GeotagPhoto icon" width="128">
+</p>
+
 Garmin Connectから取得したGPX/TCXを使って、画像にジオタグを付与するWindows向けGUIアプリです。  
 Automatically geotag your photos using Garmin Connect GPS logs.
 
@@ -28,9 +32,9 @@ Automatically geotag your photos using Garmin Connect GPS logs.
 #### ダウンロード
 
 最新版は GitHub Releases からダウンロードできます。
-- **[GeotagPhoto v1.2.1（最新）](https://github.com/HiKat/GeotagPhoto/releases/tag/v1.2.1)**
+- **[GeotagPhoto v1.2.2（最新）](https://github.com/HiKat/GeotagPhoto/releases/tag/v1.2.2)**
 
-ZIP ファイル（`GeotagPhoto-v1.2.1-win64.zip`）をダウンロードしてください。
+ZIP ファイル（`GeotagPhoto-v1.2.2-win64.zip`）をダウンロードしてください。
 
 #### 前提条件
 
@@ -130,6 +134,27 @@ GPX/TCXをGarmin ConnectやStravaからダウンロードする場合も同様�
   - ソース実行時: 使用している `python.exe` と `exiftool.exe`
 
 許可設定は、Windows セキュリティ → ウイルスと脅威の防止 → ランサムウェアの防止を管理 → コントロールされたフォルダー アクセスでアプリを許可する、から変更できます。
+
+アプリが取り込み先やGPX/TCX保存先に書き込めないことを検出した場合は、エラーログとともに **「Windows Defender の許可設定を開く」** ボタンを表示します。このボタンを押すとUAC確認付きで管理者PowerShellを起動し、現在実行中の `GeotagPhoto.exe`（ソース実行時は仮想環境の `python.exe` と Python 本体）を許可アプリへ追加します。画像取り込み時は `exiftool.exe` も見つかれば同時に追加します。許可後はGeotagPhotoを再起動してから再実行してください。
+
+PowerShell から設定する場合は、PowerShellを**管理者として実行**し、次のコマンドを実行します。以下は、GeotagPhotoとExifToolを前述の推奨先である `Program Files` 配下に配置した場合の例です。`%ProgramFiles%` はWindowsによって実際の配置先に展開されるため、システムドライブやユーザー名には依存しません。
+
+```powershell
+Add-MpPreference -ControlledFolderAccessAllowedApplications `
+  "%ProgramFiles%\GeotagPhoto\GeotagPhoto.exe", `
+  "%ProgramFiles%\exiftool*\exiftool.exe"
+```
+
+`Add-MpPreference` は既存の許可アプリを残したまま追加します。`Set-MpPreference` は既存の許可一覧を置き換えるため、この用途では使用しないでください。設定後は、起動中のGeotagPhotoとExifToolを終了してからGeotagPhotoを再起動してください。
+
+実際の配置先が異なる場合は、それぞれの実行ファイルのフルパスに置き換えてください。許可アプリのパスでは環境変数とワイルドカード `*` を使用できますが、ワイルドカードを使用できるのは**フォルダ部分だけ**です。
+
+- 使用可能: `%ProgramFiles%\exiftool*\exiftool.exe`
+- 使用不可: `%ProgramFiles%\exiftool\exiftool*.exe`
+
+ワイルドカードは許可範囲を広げるため、バージョンごとにフォルダ名が変わる場合など、必要な範囲だけに限定してください。GeotagPhotoを `C:\Program Files\GeotagPhoto` のような固定パスへ配置すると、ワイルドカードを使用せず安全に許可できます。
+
+詳細はMicrosoft公式ドキュメントの「[Configure controlled folder access](https://learn.microsoft.com/en-us/defender-endpoint/controlled-folder-access-configure)」を参照してください。
 
 1. **config.jsonの扱い**
    - 初回起動時に自動生成されます（アプリ設定を保存します）

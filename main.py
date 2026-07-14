@@ -16,6 +16,7 @@
 # along with GeotagPhoto. If not, see <https://www.gnu.org/licenses/>.
 
 import io
+import base64
 import json
 import logging
 import os
@@ -121,6 +122,195 @@ def find_exiftool() -> str:
 
     # 見つからない場合は "exiftool" を返す（FileNotFoundError を呼び出し元に委譲）
     return "exiftool"
+
+
+@dataclass(frozen=True)
+class CfaAllowlistRequest:
+    """Windows Defender CFA の許可対象アプリを保持します。"""
+
+    app_paths: Tuple[Path, ...]
+    warnings: Tuple[str, ...]
+
+
+def _get_current_process_executables_for_cfa() -> Tuple[List[Path], List[str]]:
+    """CFAで許可する現在の実行ファイル候補を返します。"""
+    candidates = [("現在の実行ファイル", sys.executable)]
+    if not getattr(sys, "frozen", False):
+        base_executable = getattr(sys, "_base_executable", "")
+        if base_executable and base_executable != sys.executable:
+            candidates.append(("Python 本体", base_executable))
+
+    app_paths: List[Path] = []
+    warnings: List[str] = []
+    for label, executable in candidates:
+        app_path = Path(executable).resolve()
+        if app_path.exists():
+            app_paths.append(app_path)
+        else:
+            warnings.append(f"{label}が見つかりません: {app_path}")
+
+    if not app_paths:
+        raise FileNotFoundError("許可対象にできる実行ファイルが見つかりません。")
+
+    return app_paths, warnings
+
+
+def prepare_cfa_allowlist_request(include_exiftool: bool = False) -> CfaAllowlistRequest:
+    """
+    Windows Defender の「コントロールされたフォルダー アクセス」で許可する
+    アプリの一覧を作成します。
+    """
+    app_paths, executable_warnings = _get_current_process_executables_for_cfa()
+    warnings: List[str] = list(executable_warnings)
+
+    if include_exiftool:
+        exiftool_path = find_exiftool()
+        if exiftool_path == "exiftool":
+            warnings.append(
+                "exiftool.exe が見つからないため、今回は GeotagPhoto / python.exe のみ許可対象にします。"
+            )
+        else:
+            resolved_exiftool_path = Path(exiftool_path).resolve()
+            if resolved_exiftool_path.exists():
+                app_paths.append(resolved_exiftool_path)
+            else:
+                warnings.append(f"exiftool.exe が見つかりません: {resolved_exiftool_path}")
+
+    unique_paths: List[Path] = []
+    seen: Set[str] = set()
+    for app_path in app_paths:
+        key = str(app_path).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(app_path)
+
+    return CfaAllowlistRequest(tuple(unique_paths), tuple(warnings))
+
+
+def _quote_powershell_single(value: str) -> str:
+    """PowerShell の単一引用符文字列としてエスケープします。"""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _quote_powershell_double_for_display(value: str) -> str:
+    """ログ表示用の PowerShell ダブルクォート文字列を作ります。"""
+    return '"' + value.replace("`", "``").replace('"', '`"') + '"'
+
+
+def format_cfa_allowlist_command(request: CfaAllowlistRequest) -> str:
+    """手動実行用の Add-MpPreference コマンドを返します。"""
+    quoted_paths = [
+        _quote_powershell_double_for_display(str(app_path))
+        for app_path in request.app_paths
+    ]
+    return (
+        "Add-MpPreference -ControlledFolderAccessAllowedApplications `\n  "
+        + ", `\n  ".join(quoted_paths)
+    )
+
+
+def _build_cfa_allowlist_script(request: CfaAllowlistRequest) -> str:
+    """管理者 PowerShell で実行する CFA 許可追加スクリプトを組み立てます。"""
+    quoted_paths = ", ".join(
+        _quote_powershell_single(str(app_path))
+        for app_path in request.app_paths
+    )
+    return f"""
+$ErrorActionPreference = 'Stop'
+$apps = @({quoted_paths})
+try {{
+    $existing = @((Get-MpPreference).ControlledFolderAccessAllowedApplications)
+    $missing = @($apps | Where-Object {{ $existing -notcontains $_ }})
+
+    if ($missing.Count -gt 0) {{
+        Add-MpPreference -ControlledFolderAccessAllowedApplications $missing
+        Write-Host ''
+        Write-Host 'Windows Defender の許可アプリに追加しました:'
+        $missing | ForEach-Object {{ Write-Host " - $_" }}
+    }} else {{
+        Write-Host ''
+        Write-Host '指定されたアプリは既に許可されています:'
+        $apps | ForEach-Object {{ Write-Host " - $_" }}
+    }}
+
+    Write-Host ''
+    Write-Host 'GeotagPhoto を再起動してから、もう一度処理を実行してください。'
+    Read-Host 'Enter キーで閉じます'
+}} catch {{
+    Write-Host ''
+    Write-Host 'Windows Defender の許可設定に失敗しました。'
+    Write-Host $_.Exception.Message
+    Write-Host ''
+    Write-Host '組織ポリシー、Microsoft Defender の管理状態、または管理者権限の制限を確認してください。'
+    Read-Host 'Enter キーで閉じます'
+    exit 1
+}}
+"""
+
+
+def launch_elevated_cfa_allowlist_powershell(request: CfaAllowlistRequest) -> None:
+    """UAC付きの管理者 PowerShell で CFA 許可追加スクリプトを起動します。"""
+    if os.name != "nt":
+        raise OSError("Windows Defender の許可設定は Windows でのみ実行できます。")
+    if not request.app_paths:
+        raise ValueError("許可対象のアプリがありません。")
+
+    script = _build_cfa_allowlist_script(request)
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    child_arguments = f"-NoProfile -EncodedCommand {encoded_script}"
+    start_command = (
+        "Start-Process -FilePath 'powershell.exe' "
+        f"-ArgumentList {_quote_powershell_single(child_arguments)} "
+        "-Verb RunAs"
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", start_command],
+        capture_output=True,
+        text=True,
+        creationflags=creationflags,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if detail:
+            raise RuntimeError(detail)
+        raise RuntimeError("管理者 PowerShell の起動がキャンセルまたは失敗しました。")
+
+
+def launch_cfa_allowlist_powershell_async(
+    include_exiftool: bool,
+    log_callback: Callable[[str], None],
+    on_finished: Optional[Callable[[], None]] = None,
+) -> None:
+    """CFA許可追加用の管理者 PowerShell 起動処理を別スレッドで実行します。"""
+    def _worker() -> None:
+        request: Optional[CfaAllowlistRequest] = None
+        try:
+            request = prepare_cfa_allowlist_request(include_exiftool=include_exiftool)
+            for warning in request.warnings:
+                log_callback(f"注意: {warning}")
+
+            log_callback("Windows Defender の許可設定を管理者 PowerShell で開きます。")
+            log_callback("UAC が表示されたら承認してください。")
+            for app_path in request.app_paths:
+                log_callback(f"許可対象: {app_path}")
+
+            launch_elevated_cfa_allowlist_powershell(request)
+            log_callback(
+                "管理者 PowerShell を起動しました。結果は PowerShell 画面で確認してください。許可後は GeotagPhoto を再起動してから再試行してください。"
+            )
+        except Exception as error:
+            log_callback(f"Windows Defender 許可設定の起動に失敗しました: {error}")
+            if request:
+                log_callback("手動で実行する場合は、管理者 PowerShell で次のコマンドを実行してください:")
+                log_callback(format_cfa_allowlist_command(request))
+        finally:
+            if on_finished:
+                on_finished()
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _tz_name_to_offset(tz_name: str) -> str:
@@ -1816,6 +2006,14 @@ class DownloadLogPopup(ctk.CTkToplevel):
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
         button_frame.pack(pady=10)
 
+        self.cfa_allow_button = ctk.CTkButton(
+            button_frame,
+            text="Windows Defender の許可設定を開く",
+            command=self.open_cfa_allowlist_settings,
+            state="disabled",
+            width=260,
+        )
+
         self.close_button = ctk.CTkButton(button_frame, text="閉じる", command=self.destroy, state="disabled")
         self.close_button.pack(side="left", padx=6)
 
@@ -2006,7 +2204,30 @@ class DownloadLogPopup(ctk.CTkToplevel):
             "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
             "GPX/TCX保存先を保護対象外のフォルダに変更してください。"
         )
+        self.show_cfa_allow_button()
         return False
+
+    def show_cfa_allow_button(self) -> None:
+        """CFA許可設定を開くボタンを表示します。"""
+        def _show() -> None:
+            if not self.cfa_allow_button.winfo_manager():
+                self.cfa_allow_button.pack(side="left", padx=6)
+            self.cfa_allow_button.configure(state="normal")
+
+        self.after(0, _show)
+
+    def open_cfa_allowlist_settings(self) -> None:
+        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
+        self.cfa_allow_button.configure(state="disabled")
+
+        def _enable_button() -> None:
+            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
+
+        launch_cfa_allowlist_powershell_async(
+            include_exiftool=False,
+            log_callback=self.update_log,
+            on_finished=_enable_button,
+        )
 
     def update_log(self, message: str) -> None:
         """
@@ -2153,6 +2374,14 @@ class StravaDownloadPopup(ctk.CTkToplevel):
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
         button_frame.pack(pady=10)
 
+        self.cfa_allow_button = ctk.CTkButton(
+            button_frame,
+            text="Windows Defender の許可設定を開く",
+            command=self.open_cfa_allowlist_settings,
+            state="disabled",
+            width=260,
+        )
+
         self.close_button = ctk.CTkButton(button_frame, text="閉じる", command=self.destroy, state="disabled")
         self.close_button.pack(side="left", padx=6)
 
@@ -2241,7 +2470,30 @@ class StravaDownloadPopup(ctk.CTkToplevel):
             "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
             "GPX保存先を保護対象外のフォルダに変更してください。"
         )
+        self.show_cfa_allow_button()
         return False
+
+    def show_cfa_allow_button(self) -> None:
+        """CFA許可設定を開くボタンを表示します。"""
+        def _show() -> None:
+            if not self.cfa_allow_button.winfo_manager():
+                self.cfa_allow_button.pack(side="left", padx=6)
+            self.cfa_allow_button.configure(state="normal")
+
+        self.after(0, _show)
+
+    def open_cfa_allowlist_settings(self) -> None:
+        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
+        self.cfa_allow_button.configure(state="disabled")
+
+        def _enable_button() -> None:
+            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
+
+        launch_cfa_allowlist_powershell_async(
+            include_exiftool=False,
+            log_callback=self.update_log,
+            on_finished=_enable_button,
+        )
 
     def update_log(self, message: str) -> None:
         """ログを表示します。"""
@@ -2307,10 +2559,29 @@ class ProcessingPopup(ctk.CTkToplevel):
         self.console_log._textbox.tag_configure("error_tag", foreground="#ff6666")
         self.console_log._textbox.tag_configure("warning_tag", foreground="#ffaa44")
 
-        # 閉じるボタン（最初は無効・処理完了後に有効化）
+        # ボタン（閉じるボタンは最初は無効・処理完了後に有効化）
+        self.button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.button_frame.pack(pady=15)
+
+        self.cfa_allow_button = ctk.CTkButton(
+            self.button_frame,
+            text="Windows Defender の許可設定を開く",
+            command=self.open_cfa_allowlist_settings,
+            state="disabled",
+            width=260,
+            height=35,
+        )
+
         # command は close_popup に設定し、閉じると同時にGPX軌跡を再描画します。
-        self.close_button = ctk.CTkButton(self, text="閉じる", command=self.close_popup, state="disabled", width=120, height=35)
-        self.close_button.pack(pady=15)
+        self.close_button = ctk.CTkButton(
+            self.button_frame,
+            text="閉じる",
+            command=self.close_popup,
+            state="disabled",
+            width=120,
+            height=35,
+        )
+        self.close_button.pack(side="left", padx=6)
         
         # 自動的に処理を開始
         self.after(500, self.start_processing)
@@ -2362,6 +2633,31 @@ class ProcessingPopup(ctk.CTkToplevel):
             self.error_banner.pack(pady=(6, 4), padx=20, fill="x")
         self.after(0, _show)
 
+    def show_cfa_allow_button(self) -> None:
+        """CFA許可設定を開くボタンを表示します。"""
+        def _show() -> None:
+            if not self.cfa_allow_button.winfo_manager():
+                self.cfa_allow_button.pack(side="left", padx=6)
+            self.cfa_allow_button.configure(state="normal")
+
+        self.after(0, _show)
+
+    def open_cfa_allowlist_settings(self) -> None:
+        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
+        self.cfa_allow_button.configure(state="disabled")
+
+        def _log(message: str) -> None:
+            self.log_message(message, "INFO")
+
+        def _enable_button() -> None:
+            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
+
+        launch_cfa_allowlist_powershell_async(
+            include_exiftool=True,
+            log_callback=_log,
+            on_finished=_enable_button,
+        )
+
     def log_message(self, message: str, level: str = "INFO") -> None:
         """
         コンソールログにメッセージを追加します。
@@ -2412,6 +2708,7 @@ class ProcessingPopup(ctk.CTkToplevel):
             "ブロックされている可能性があります。GeotagPhoto.exe / python.exe と "
             "exiftool.exe を許可するか、取り込み先を別フォルダに変更してください。"
         )
+        self.show_cfa_allow_button()
         self.update_progress("取り込み先に書き込めません", 0, 0)
         return False
 
@@ -2443,6 +2740,7 @@ class ProcessingPopup(ctk.CTkToplevel):
                         "取り込み先ディレクトリを作成できません。Windows Defender の保護機能や"
                         "アクセス権限によりブロックされている可能性があります。"
                     )
+                    self.show_cfa_allow_button()
                     self.is_processing = False
                     self.after(0, lambda: self.close_button.configure(state="normal"))
                     return
