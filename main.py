@@ -225,32 +225,16 @@ try {{
 
     if ($missing.Count -gt 0) {{
         Add-MpPreference -ControlledFolderAccessAllowedApplications $missing
-        Write-Host ''
-        Write-Host 'Windows Defender の許可アプリに追加しました:'
-        $missing | ForEach-Object {{ Write-Host " - $_" }}
-    }} else {{
-        Write-Host ''
-        Write-Host '指定されたアプリは既に許可されています:'
-        $apps | ForEach-Object {{ Write-Host " - $_" }}
     }}
-
-    Write-Host ''
-    Write-Host 'GeotagPhoto を再起動してから、もう一度処理を実行してください。'
-    Read-Host 'Enter キーで閉じます'
+    exit 0
 }} catch {{
-    Write-Host ''
-    Write-Host 'Windows Defender の許可設定に失敗しました。'
-    Write-Host $_.Exception.Message
-    Write-Host ''
-    Write-Host '組織ポリシー、Microsoft Defender の管理状態、または管理者権限の制限を確認してください。'
-    Read-Host 'Enter キーで閉じます'
     exit 1
 }}
 """
 
 
 def launch_elevated_cfa_allowlist_powershell(request: CfaAllowlistRequest) -> None:
-    """UAC付きの管理者 PowerShell で CFA 許可追加スクリプトを起動します。"""
+    """UAC付きの管理者 PowerShell で CFA 許可追加スクリプトを実行します。"""
     if os.name != "nt":
         raise OSError("Windows Defender の許可設定は Windows でのみ実行できます。")
     if not request.app_paths:
@@ -258,11 +242,15 @@ def launch_elevated_cfa_allowlist_powershell(request: CfaAllowlistRequest) -> No
 
     script = _build_cfa_allowlist_script(request)
     encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    child_arguments = f"-NoProfile -EncodedCommand {encoded_script}"
+    child_arguments = f"-NoProfile -NonInteractive -EncodedCommand {encoded_script}"
     start_command = (
-        "Start-Process -FilePath 'powershell.exe' "
+        "$ErrorActionPreference = 'Stop'; "
+        "try { "
+        "$process = Start-Process -FilePath 'powershell.exe' "
         f"-ArgumentList {_quote_powershell_single(child_arguments)} "
-        "-Verb RunAs"
+        "-Verb RunAs -WindowStyle Hidden -Wait -PassThru; "
+        "exit $process.ExitCode "
+        "} catch { [Console]::Error.Write($_.Exception.Message); exit 1 }"
     )
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     completed = subprocess.run(
@@ -282,33 +270,36 @@ def launch_elevated_cfa_allowlist_powershell(request: CfaAllowlistRequest) -> No
 def launch_cfa_allowlist_powershell_async(
     include_exiftool: bool,
     log_callback: Callable[[str], None],
-    on_finished: Optional[Callable[[], None]] = None,
+    on_finished: Optional[Callable[[bool, str], None]] = None,
 ) -> None:
-    """CFA許可追加用の管理者 PowerShell 起動処理を別スレッドで実行します。"""
+    """CFA許可追加用の管理者 PowerShell を別スレッドで実行します。"""
     def _worker() -> None:
         request: Optional[CfaAllowlistRequest] = None
+        success = False
+        result_message = ""
         try:
             request = prepare_cfa_allowlist_request(include_exiftool=include_exiftool)
             for warning in request.warnings:
                 log_callback(f"注意: {warning}")
 
-            log_callback("Windows Defender の許可設定を管理者 PowerShell で開きます。")
+            log_callback("Windows Defender の許可設定を変更します。")
             log_callback("UAC が表示されたら承認してください。")
             for app_path in request.app_paths:
                 log_callback(f"許可対象: {app_path}")
 
             launch_elevated_cfa_allowlist_powershell(request)
-            log_callback(
-                "管理者 PowerShell を起動しました。結果は PowerShell 画面で確認してください。許可後は GeotagPhoto を再起動してから再試行してください。"
-            )
+            success = True
+            result_message = "Windows Defender の許可アプリに追加しました。"
+            log_callback(result_message)
         except Exception as error:
-            log_callback(f"Windows Defender 許可設定の起動に失敗しました: {error}")
+            result_message = f"Windows Defender の許可設定に失敗しました: {error}"
+            log_callback(result_message)
             if request:
                 log_callback("手動で実行する場合は、管理者 PowerShell で次のコマンドを実行してください:")
                 log_callback(format_cfa_allowlist_command(request))
         finally:
             if on_finished:
-                on_finished()
+                on_finished(success, result_message)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -352,6 +343,394 @@ def check_directory_writable(directory: Path) -> Tuple[bool, Optional[Path], Opt
         except Exception:
             pass
         return False, test_path, error
+
+
+def check_exiftool_directory_writable(
+    directory: Path,
+) -> Tuple[bool, Optional[Path], Optional[Exception]]:
+    """ExifToolが指定フォルダー内のファイルを実際に更新できるか確認します。"""
+    test_path = directory / (
+        f"GeotagPhoto_exiftool_write_test_{os.getpid()}_{threading.get_ident()}.jpg"
+    )
+    backup_path = Path(str(test_path) + "_original")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        test_asset = get_static_asset_path("logo", "app.png")
+        if not test_asset.exists():
+            raise FileNotFoundError(f"ExifTool書き込みテスト用画像が見つかりません: {test_asset}")
+        with Image.open(test_asset) as image:
+            image.convert("RGB").save(test_path, format="JPEG", quality=80)
+
+        exiftool_path = find_exiftool()
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [
+                exiftool_path,
+                "-overwrite_original",
+                "-XMP:Label=GeotagPhotoWriteTest",
+                str(test_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=creationflags,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise PermissionError(
+                "ExifToolによるテストファイル更新に失敗しました"
+                + (f": {detail}" if detail else f" (終了コード {result.returncode})")
+            )
+
+        return True, test_path, None
+    except Exception as error:
+        return False, test_path, error
+    finally:
+        for cleanup_path in (test_path, backup_path):
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def check_required_directory_writes(
+    directory: Path,
+    *,
+    include_exiftool: bool,
+) -> Tuple[bool, str, Optional[Path], Optional[Exception]]:
+    """アプリ本体と、必要ならExifToolの書き込み可否を確認します。"""
+    ok, test_path, error = check_directory_writable(directory)
+    if not ok:
+        return False, "GeotagPhoto.exe、もしくは python.exe", test_path, error
+
+    if include_exiftool:
+        ok, test_path, error = check_exiftool_directory_writable(directory)
+        if not ok:
+            return False, "ExifTool", test_path, error
+
+    return True, "", test_path, None
+
+
+class WritePermissionDialog(ctk.CTkToplevel):
+    """保存先の書き込みエラーを、この画面から解消するためのダイアログです。"""
+
+    def __init__(
+        self,
+        master,
+        directory: Path,
+        error: Exception,
+        *,
+        include_exiftool: bool,
+        setting_key: Optional[str],
+        target_entry,
+        log_callback: Callable[[str], None],
+    ):
+        super().__init__(master)
+        self.title("保存先フォルダーの書き込み権限")
+        self.geometry("760x520")
+        self.minsize(680, 480)
+        self.transient(master)
+
+        self.parent_window = master
+        self.directory = Path(directory)
+        self.last_error: Exception = error
+        self.include_exiftool = include_exiftool
+        self.setting_key = setting_key
+        self.target_entry = target_entry
+        self.log_callback = log_callback
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self,
+            text="保存先フォルダーに書き込めません",
+            font=("Yu Gothic UI", 20, "bold"),
+            text_color="#FF6B6B",
+        ).pack(pady=(22, 8), padx=24)
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Windows Defender の「コントロールされたフォルダー アクセス」、"
+                "フォルダーのアクセス権、または保存先の未作成が原因の可能性があります。"
+            ),
+            font=("Yu Gothic UI", 13),
+            wraplength=690,
+            justify="left",
+        ).pack(pady=(0, 14), padx=24, anchor="w")
+
+        path_frame = ctk.CTkFrame(self)
+        path_frame.pack(fill="x", padx=24, pady=4)
+        ctk.CTkLabel(
+            path_frame,
+            text="保存先",
+            font=("Yu Gothic UI", 12, "bold"),
+            width=70,
+            anchor="w",
+        ).pack(side="left", padx=(12, 6), pady=10)
+        self.path_label = ctk.CTkLabel(
+            path_frame,
+            text=str(self.directory),
+            font=("Yu Gothic UI", 12),
+            wraplength=600,
+            justify="left",
+            anchor="w",
+        )
+        self.path_label.pack(side="left", fill="x", expand=True, padx=(0, 12), pady=10)
+
+        self.diagnosis_label = ctk.CTkLabel(
+            self,
+            text=self._diagnosis_text(),
+            font=("Yu Gothic UI", 12),
+            text_color="#D0D0D0",
+            wraplength=690,
+            justify="left",
+            anchor="w",
+        )
+        self.diagnosis_label.pack(fill="x", padx=24, pady=(8, 10))
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "「Defender の許可に追加」を押すと、GeotagPhoto.exe、もしくは python.exe"
+                + (" と exiftool.exe" if include_exiftool else "")
+                + " を許可アプリに追加します。Windows のユーザー アカウント制御が"
+                "表示されたら「はい」を選択してください。許可設定の完了後に"
+                "「書き込みを再チェック」を押してください。"
+            ),
+            font=("Yu Gothic UI", 12),
+            wraplength=690,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 12))
+
+        self.status_label = ctk.CTkLabel(
+            self,
+            text=(
+                "下のいずれかの方法で解決した後、必ず"
+                "「書き込みを再チェック」を押してください。"
+            ),
+            font=("Yu Gothic UI", 12, "bold"),
+            wraplength=690,
+            justify="left",
+            anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=24, pady=(0, 14))
+
+        action_frame = ctk.CTkFrame(self, fg_color="transparent")
+        action_frame.pack(fill="x", padx=18, pady=4)
+
+        self.allow_button = ctk.CTkButton(
+            action_frame,
+            text="Defender の許可に追加",
+            command=self._allow_in_defender,
+            width=210,
+        )
+        self.allow_button.pack(side="left", padx=6)
+        if os.name != "nt":
+            self.allow_button.configure(state="disabled")
+
+        ctk.CTkButton(
+            action_frame,
+            text="別の保存先を選択",
+            command=self._choose_directory,
+            width=190,
+        ).pack(side="left", padx=6)
+
+        ctk.CTkButton(
+            action_frame,
+            text="書き込みを再チェック",
+            command=self._check_writable,
+            width=190,
+        ).pack(side="left", padx=6)
+
+        self.close_button = ctk.CTkButton(
+            self,
+            text="閉じる",
+            command=self._close,
+            width=130,
+            fg_color="gray40",
+        )
+        self.close_button.pack(pady=(18, 16))
+        self.after(100, self.focus_force)
+
+    def _diagnosis_text(self) -> str:
+        return f"診断: {type(self.last_error).__name__}: {self.last_error}"
+
+    def _set_status(self, message: str, color: str) -> None:
+        self.status_label.configure(text=message, text_color=color)
+
+    def _log(self, message: str) -> None:
+        try:
+            self.log_callback(message)
+        except Exception:
+            print(message)
+
+    def _allow_in_defender(self) -> None:
+        self.allow_button.configure(state="disabled")
+        self._set_status(
+            "Windows の確認画面を待っています。表示されたら「はい」を選択してください。",
+            "#E8A030",
+        )
+
+        def _finished(success: bool, message: str) -> None:
+            self.after(0, lambda: self._on_allow_finished(success, message))
+
+        launch_cfa_allowlist_powershell_async(
+            include_exiftool=self.include_exiftool,
+            log_callback=self._log,
+            on_finished=_finished,
+        )
+
+    def _on_allow_finished(self, success: bool, message: str) -> None:
+        if not self.winfo_exists():
+            return
+        self.allow_button.configure(state="normal")
+        if not success:
+            self._set_status(
+                message
+                + "\n管理対象PCでは組織のポリシーにより変更できない場合があります。"
+                "その場合は別の保存先を選択してください。",
+                "#FF6B6B",
+            )
+            return
+
+        self._set_status(
+            "Defender の許可アプリに追加しました。"
+            "続けて「書き込みを再チェック」を押してください。",
+            "#55C271",
+        )
+
+    def _choose_directory(self) -> None:
+        initial_dir = self.directory
+        while not initial_dir.exists() and initial_dir != initial_dir.parent:
+            initial_dir = initial_dir.parent
+
+        selected = filedialog.askdirectory(parent=self, initialdir=str(initial_dir))
+        if not selected:
+            return
+
+        new_directory = Path(selected)
+        self.directory = new_directory
+        self.path_label.configure(text=str(self.directory))
+
+        ok, failed_component, _test_path, error = check_required_directory_writes(
+            new_directory,
+            include_exiftool=self.include_exiftool,
+        )
+        if not ok:
+            self.last_error = error or OSError("原因を特定できませんでした。")
+            self.diagnosis_label.configure(text=self._diagnosis_text())
+            self._set_status(
+                f"❌ {failed_component} が選択したフォルダーに書き込めないため、"
+                "保存先設定は変更していません。"
+                "別のフォルダーを選択してください。",
+                "#FF6B6B",
+            )
+            self._log(f"選択した保存先に書き込めません: {self.directory} - {self.last_error}")
+            return
+
+        try:
+            if self.setting_key:
+                SettingsManager.save({self.setting_key: str(new_directory)})
+            if self.target_entry is not None and self.target_entry.winfo_exists():
+                self.target_entry.delete(0, "end")
+                self.target_entry.insert(0, str(new_directory))
+        except Exception as error:
+            self.last_error = error
+            self.diagnosis_label.configure(text=self._diagnosis_text())
+            self._set_status(f"保存先設定の更新に失敗しました: {error}", "#FF6B6B")
+            return
+
+        self._set_status(
+            "✅ 保存先を変更し、書き込めることを確認しました。"
+            "この画面を閉じ、元の操作をもう一度実行してください。",
+            "#55C271",
+        )
+        self.close_button.configure(text="完了して閉じる", fg_color="#2E8B57")
+        self._log(f"書き込み可能な保存先へ変更しました: {self.directory}")
+
+    def _check_writable(self) -> bool:
+        ok, failed_component, _test_path, error = check_required_directory_writes(
+            self.directory,
+            include_exiftool=self.include_exiftool,
+        )
+        if ok:
+            self._set_status(
+                "✅ 必要なアプリがこの保存先に書き込めることを確認しました。"
+                "この画面を閉じ、元の操作をもう一度実行してください。",
+                "#55C271",
+            )
+            self.close_button.configure(text="完了して閉じる", fg_color="#2E8B57")
+            self._log(f"保存先の書き込み確認に成功しました: {self.directory}")
+            return True
+
+        self.last_error = error or OSError("原因を特定できませんでした。")
+        self.diagnosis_label.configure(text=self._diagnosis_text())
+        self._set_status(
+            f"❌ {failed_component} がまだ書き込めません。"
+            "アプリを再起動して再確認するか、"
+            "「別の保存先を選択」を使用してください。",
+            "#FF6B6B",
+        )
+        self._log(f"保存先の書き込み再確認に失敗しました: {self.directory} - {self.last_error}")
+        return False
+
+    def _close(self) -> None:
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            setattr(self.parent_window, "_write_permission_dialog", None)
+        except Exception:
+            pass
+        self.destroy()
+        try:
+            if self.parent_window.winfo_exists():
+                self.parent_window.grab_set()
+                self.parent_window.focus_force()
+        except Exception:
+            pass
+
+
+def show_write_permission_dialog(
+    parent,
+    directory: Path,
+    error: Exception,
+    *,
+    include_exiftool: bool,
+    setting_key: Optional[str],
+    target_entry,
+    log_callback: Callable[[str], None],
+) -> None:
+    """書き込みエラー解決ダイアログをGUIスレッドで表示します。"""
+
+    def _show() -> None:
+        existing = getattr(parent, "_write_permission_dialog", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+
+        dialog = WritePermissionDialog(
+            parent,
+            directory,
+            error,
+            include_exiftool=include_exiftool,
+            setting_key=setting_key,
+            target_entry=target_entry,
+            log_callback=log_callback,
+        )
+        parent._write_permission_dialog = dialog
+
+    parent.after(0, _show)
 
 
 def list_gpx_or_tcx_files(gpx_dir: Path) -> List[Path]:
@@ -1163,11 +1542,18 @@ class GeotagLogEntry:
         return "付与なし"
 
 
-def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]) -> subprocess.CompletedProcess:
+def _run_exiftool_argfile(
+    exiftool_path: str,
+    args: List[str],
+    files: List[Path],
+    *,
+    fail_on_warning: bool = False,
+) -> subprocess.CompletedProcess:
     """
     ExifToolを引数ファイル(-@)経由で実行します。
     Windowsのコマンドライン長制限を回避するため、ファイルパスを一時ファイルに書き出して渡します。
-    ExifToolの終了コード1（軽微な警告）は正常扱いとし、2以上のみ例外を送出します。
+    読み取り処理では終了コード1（軽微な警告）を許容します。
+    書き込み処理は fail_on_warning=True とし、終了コード1も失敗として扱います。
     """
     argfile_path = None
     try:
@@ -1185,8 +1571,8 @@ def _run_exiftool_argfile(exiftool_path: str, args: List[str], files: List[Path]
             capture_output=True, encoding='utf-8', errors='ignore',
             creationflags=subprocess.CREATE_NO_WINDOW
         )
-        # ExifTool終了コード: 0=成功, 1=軽微な警告(正常扱い), 2=致命的エラー
-        if result.returncode >= 2:
+        # ExifTool終了コード: 0=成功、1=警告または一部ファイルの更新失敗、2以上=致命的エラー
+        if result.returncode >= 2 or (fail_on_warning and result.returncode != 0):
             raise subprocess.CalledProcessError(
                 result.returncode, [exiftool_path, '-@', argfile_path],
                 output=result.stdout, stderr=result.stderr
@@ -1282,7 +1668,7 @@ def _classify_files_by_offset_time(exiftool_path: str, files: List[Path]) -> tup
         return [], files
 
 
-def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Path, file_extensions: set, overwrite_existing: bool = False, max_workers: int = 4, camera_tz_offset: str = "") -> tuple[int, int]:
+def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Path, file_extensions: set, overwrite_existing: bool = False, max_workers: int = 4, camera_tz_offset: str = "") -> tuple[int, int, int]:
     """
     ExifToolでGPX/TCXを使ってジオタギングを行います。
     複数のGPXファイルを同時に指定でき、並列処理で高速化します。
@@ -1300,7 +1686,11 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
             空文字の場合はExifToolのデフォルト動作（システムタイムゾーン）を使用。
     
     Returns:
-        tuple: (ジオタグを付与したファイル数, スキップしたファイル数)
+        tuple: (
+            ジオタグを付与したファイル数,
+            既存GPS情報のためスキップしたファイル数,
+            軌跡時刻と一致しなかったファイル数,
+        )
     """
     # 処理対象のファイルを収集（custom_extsにマッチするファイルのみ）
     all_files = [
@@ -1311,7 +1701,7 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
     
     if not all_files:
         # 処理対象がない場合は何もしない
-        return 0, 0
+        return 0, 0, 0
     
     # 上書き設定に応じて処理対象を決定
     if overwrite_existing:
@@ -1326,7 +1716,7 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
     
     if not files_to_process:
         # 処理対象がない場合は何もしない
-        return 0, skipped_count
+        return 0, skipped_count, 0
     
     # ExifTool基本引数を構築: 複数GPXファイルを全て指定
     base_geotag_args = ['-overwrite_original']
@@ -1343,40 +1733,53 @@ def run_exiftool_geotag(exiftool_path: str, gpx_files: List[Path], dest_dir: Pat
     if camera_tz_offset:
         geotag_args_fallback.append(f'-geotime<${{DateTimeOriginal}}{camera_tz_offset}')
     
-    def _run_geotag_group(files: List[Path], geotag_args: list) -> int:
-        """指定されたファイル群にジオタグを付与し、処理数を返す"""
+    def _run_geotag_group(files: List[Path], geotag_args: list) -> None:
+        """指定されたファイル群にジオタグを付与します。"""
         if not files:
-            return 0
+            return
         
         if max_workers <= 1 or len(files) <= 10:
-            _run_exiftool_argfile(exiftool_path, geotag_args, files)
-            return len(files)
+            _run_exiftool_argfile(
+                exiftool_path,
+                geotag_args,
+                files,
+                fail_on_warning=True,
+            )
+            return
         
         batch_size = max(5, len(files) // max_workers)
         batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
         
         def process_batch(batch_files: List[Path]) -> int:
             try:
-                _run_exiftool_argfile(exiftool_path, geotag_args, batch_files)
+                _run_exiftool_argfile(
+                    exiftool_path,
+                    geotag_args,
+                    batch_files,
+                    fail_on_warning=True,
+                )
                 return len(batch_files)
             except subprocess.CalledProcessError as e:
                 stderr_msg = e.stderr.strip() if e.stderr else f"exit code {e.returncode}"
                 print(f"⚠ バッチ処理でエラー: {stderr_msg}")
-                return 0
+                raise
             except Exception as e:
                 print(f"⚠ バッチ処理でエラー: {e}")
-                return 0
+                raise
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return sum(executor.map(process_batch, batches))
+            list(executor.map(process_batch, batches))
     
-    processed_count = 0
     # グループ1: OffsetTimeOriginalがある写真（ExifToolのデフォルト動作）
-    processed_count += _run_geotag_group(files_with_offset, geotag_args_default)
+    _run_geotag_group(files_with_offset, geotag_args_default)
     # グループ2: OffsetTimeOriginalがない写真（カメラTZ設定をフォールバック）
-    processed_count += _run_geotag_group(files_without_offset, geotag_args_fallback)
+    _run_geotag_group(files_without_offset, geotag_args_fallback)
     
-    return processed_count, skipped_count
+    files_without_match, files_with_new_geotag = filter_files_without_gps(
+        exiftool_path,
+        files_to_process,
+    )
+    return len(files_with_new_geotag), skipped_count, len(files_without_match)
 
 
 def collect_exif_log(exiftool_path: str, dest_dir: Path, file_extensions: set) -> List[GeotagLogEntry]:
@@ -2006,12 +2409,12 @@ class DownloadLogPopup(ctk.CTkToplevel):
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
         button_frame.pack(pady=10)
 
-        self.cfa_allow_button = ctk.CTkButton(
+        self.write_permission_button = ctk.CTkButton(
             button_frame,
-            text="Windows Defender の許可設定を開く",
-            command=self.open_cfa_allowlist_settings,
+            text="書き込み権限を変更",
+            command=self.open_write_permission_dialog,
             state="disabled",
-            width=260,
+            width=210,
         )
 
         self.close_button = ctk.CTkButton(button_frame, text="閉じる", command=self.destroy, state="disabled")
@@ -2201,32 +2604,38 @@ class DownloadLogPopup(ctk.CTkToplevel):
             "ブロックされている可能性があります。"
         )
         self.update_log(
-            "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
+            "対処: GeotagPhoto.exe、もしくは python.exe を許可するか、"
             "GPX/TCX保存先を保護対象外のフォルダに変更してください。"
         )
-        self.show_cfa_allow_button()
+        self._last_write_issue = (gpx_dir, error)
+        self.show_write_permission_button()
+        self.open_write_permission_dialog()
         return False
 
-    def show_cfa_allow_button(self) -> None:
-        """CFA許可設定を開くボタンを表示します。"""
+    def show_write_permission_button(self) -> None:
+        """書き込みエラー解決ダイアログを再表示するボタンを表示します。"""
         def _show() -> None:
-            if not self.cfa_allow_button.winfo_manager():
-                self.cfa_allow_button.pack(side="left", padx=6)
-            self.cfa_allow_button.configure(state="normal")
+            if not self.write_permission_button.winfo_manager():
+                self.write_permission_button.pack(side="left", padx=6)
+            self.write_permission_button.configure(state="normal")
 
         self.after(0, _show)
 
-    def open_cfa_allowlist_settings(self) -> None:
-        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
-        self.cfa_allow_button.configure(state="disabled")
-
-        def _enable_button() -> None:
-            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
-
-        launch_cfa_allowlist_powershell_async(
+    def open_write_permission_dialog(self) -> None:
+        """書き込みエラーを解決する専用ダイアログを表示します。"""
+        issue = getattr(self, "_last_write_issue", None)
+        if issue is None:
+            self.update_log("書き込みエラーの情報がありません。もう一度ダウンロードを実行してください。")
+            return
+        directory, error = issue
+        show_write_permission_dialog(
+            self,
+            directory,
+            error,
             include_exiftool=False,
+            setting_key="gpx_dir",
+            target_entry=getattr(self.master, "gpx_entry", None),
             log_callback=self.update_log,
-            on_finished=_enable_button,
         )
 
     def update_log(self, message: str) -> None:
@@ -2374,12 +2783,12 @@ class StravaDownloadPopup(ctk.CTkToplevel):
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
         button_frame.pack(pady=10)
 
-        self.cfa_allow_button = ctk.CTkButton(
+        self.write_permission_button = ctk.CTkButton(
             button_frame,
-            text="Windows Defender の許可設定を開く",
-            command=self.open_cfa_allowlist_settings,
+            text="書き込み権限を変更",
+            command=self.open_write_permission_dialog,
             state="disabled",
-            width=260,
+            width=210,
         )
 
         self.close_button = ctk.CTkButton(button_frame, text="閉じる", command=self.destroy, state="disabled")
@@ -2467,32 +2876,38 @@ class StravaDownloadPopup(ctk.CTkToplevel):
             "ブロックされている可能性があります。"
         )
         self.update_log(
-            "対処: GeotagPhoto.exe（開発中は python.exe）を許可するか、"
+            "対処: GeotagPhoto.exe、もしくは python.exe を許可するか、"
             "GPX保存先を保護対象外のフォルダに変更してください。"
         )
-        self.show_cfa_allow_button()
+        self._last_write_issue = (gpx_dir, error)
+        self.show_write_permission_button()
+        self.open_write_permission_dialog()
         return False
 
-    def show_cfa_allow_button(self) -> None:
-        """CFA許可設定を開くボタンを表示します。"""
+    def show_write_permission_button(self) -> None:
+        """書き込みエラー解決ダイアログを再表示するボタンを表示します。"""
         def _show() -> None:
-            if not self.cfa_allow_button.winfo_manager():
-                self.cfa_allow_button.pack(side="left", padx=6)
-            self.cfa_allow_button.configure(state="normal")
+            if not self.write_permission_button.winfo_manager():
+                self.write_permission_button.pack(side="left", padx=6)
+            self.write_permission_button.configure(state="normal")
 
         self.after(0, _show)
 
-    def open_cfa_allowlist_settings(self) -> None:
-        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
-        self.cfa_allow_button.configure(state="disabled")
-
-        def _enable_button() -> None:
-            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
-
-        launch_cfa_allowlist_powershell_async(
+    def open_write_permission_dialog(self) -> None:
+        """書き込みエラーを解決する専用ダイアログを表示します。"""
+        issue = getattr(self, "_last_write_issue", None)
+        if issue is None:
+            self.update_log("書き込みエラーの情報がありません。もう一度ダウンロードを実行してください。")
+            return
+        directory, error = issue
+        show_write_permission_dialog(
+            self,
+            directory,
+            error,
             include_exiftool=False,
+            setting_key="gpx_dir",
+            target_entry=getattr(self.master, "gpx_entry", None),
             log_callback=self.update_log,
-            on_finished=_enable_button,
         )
 
     def update_log(self, message: str) -> None:
@@ -2563,12 +2978,12 @@ class ProcessingPopup(ctk.CTkToplevel):
         self.button_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.button_frame.pack(pady=15)
 
-        self.cfa_allow_button = ctk.CTkButton(
+        self.write_permission_button = ctk.CTkButton(
             self.button_frame,
-            text="Windows Defender の許可設定を開く",
-            command=self.open_cfa_allowlist_settings,
+            text="書き込み権限を変更",
+            command=self.open_write_permission_dialog,
             state="disabled",
-            width=260,
+            width=210,
             height=35,
         )
 
@@ -2633,29 +3048,30 @@ class ProcessingPopup(ctk.CTkToplevel):
             self.error_banner.pack(pady=(6, 4), padx=20, fill="x")
         self.after(0, _show)
 
-    def show_cfa_allow_button(self) -> None:
-        """CFA許可設定を開くボタンを表示します。"""
+    def show_write_permission_button(self) -> None:
+        """書き込みエラー解決ダイアログを再表示するボタンを表示します。"""
         def _show() -> None:
-            if not self.cfa_allow_button.winfo_manager():
-                self.cfa_allow_button.pack(side="left", padx=6)
-            self.cfa_allow_button.configure(state="normal")
+            if not self.write_permission_button.winfo_manager():
+                self.write_permission_button.pack(side="left", padx=6)
+            self.write_permission_button.configure(state="normal")
 
         self.after(0, _show)
 
-    def open_cfa_allowlist_settings(self) -> None:
-        """管理者 PowerShell で CFA の許可アプリ追加を試みます。"""
-        self.cfa_allow_button.configure(state="disabled")
-
-        def _log(message: str) -> None:
-            self.log_message(message, "INFO")
-
-        def _enable_button() -> None:
-            self.after(0, lambda: self.cfa_allow_button.configure(state="normal"))
-
-        launch_cfa_allowlist_powershell_async(
+    def open_write_permission_dialog(self) -> None:
+        """書き込みエラーを解決する専用ダイアログを表示します。"""
+        issue = getattr(self, "_last_write_issue", None)
+        if issue is None:
+            self.log_message("書き込みエラーの情報がありません。もう一度取り込みを実行してください。", "WARNING")
+            return
+        directory, error = issue
+        show_write_permission_dialog(
+            self,
+            directory,
+            error,
             include_exiftool=True,
-            log_callback=_log,
-            on_finished=_enable_button,
+            setting_key="img_dest",
+            target_entry=self.dest_entry,
+            log_callback=lambda message: self.log_message(message, "INFO"),
         )
 
     def log_message(self, message: str, level: str = "INFO") -> None:
@@ -2685,13 +3101,17 @@ class ProcessingPopup(ctk.CTkToplevel):
         Windows Defender のコントロールされたフォルダー アクセスなどで
         Pictures 配下への書き込みがブロックされる場合、ここで検出します。
         """
-        ok, test_path, error = check_directory_writable(dest_dir)
+        ok, failed_component, test_path, error = check_required_directory_writes(
+            dest_dir,
+            include_exiftool=True,
+        )
         if ok:
             return True
 
         self.log_message("取り込み先フォルダに書き込めません", "ERROR")
         self.log_message(f"取り込み先: {dest_dir}", "ERROR")
-        self.log_message(f"診断: 一時ファイル作成に失敗しました: {test_path} - {error}", "ERROR")
+        self.log_message(f"書き込み失敗: {failed_component}", "ERROR")
+        self.log_message(f"診断: 書き込みテストに失敗しました: {test_path} - {error}", "ERROR")
         self.log_message(
             "Windows Defender の「コントロールされたフォルダー アクセス」により、"
             "Pictures / Documents / Desktop などの保護フォルダ配下への書き込みが"
@@ -2699,7 +3119,7 @@ class ProcessingPopup(ctk.CTkToplevel):
             "ERROR",
         )
         self.log_message(
-            "対処: GeotagPhoto.exe（開発中は python.exe）と exiftool.exe を許可するか、"
+            "対処: GeotagPhoto.exe（もしくは python.exe）と exiftool.exe を許可するか、"
             "取り込み先を保護対象外のフォルダに変更してください。",
             "ERROR",
         )
@@ -2708,7 +3128,9 @@ class ProcessingPopup(ctk.CTkToplevel):
             "ブロックされている可能性があります。GeotagPhoto.exe / python.exe と "
             "exiftool.exe を許可するか、取り込み先を別フォルダに変更してください。"
         )
-        self.show_cfa_allow_button()
+        self._last_write_issue = (dest_dir, error)
+        self.show_write_permission_button()
+        self.open_write_permission_dialog()
         self.update_progress("取り込み先に書き込めません", 0, 0)
         return False
 
@@ -2740,7 +3162,9 @@ class ProcessingPopup(ctk.CTkToplevel):
                         "取り込み先ディレクトリを作成できません。Windows Defender の保護機能や"
                         "アクセス権限によりブロックされている可能性があります。"
                     )
-                    self.show_cfa_allow_button()
+                    self._last_write_issue = (dest_dir, e)
+                    self.show_write_permission_button()
+                    self.open_write_permission_dialog()
                     self.is_processing = False
                     self.after(0, lambda: self.close_button.configure(state="normal"))
                     return
@@ -2819,11 +3243,25 @@ class ProcessingPopup(ctk.CTkToplevel):
                 # カメラタイムゾーンからUTCオフセット文字列を生成
                 camera_tz_str = settings.get("camera_timezone", "Asia/Tokyo")
                 camera_tz_offset = _tz_name_to_offset(camera_tz_str)
-                tagged_count, skipped_count = run_exiftool_geotag(exiftool_path, gpx_files, dest_dir, file_extensions, overwrite_existing, max_workers, camera_tz_offset)
+                tagged_count, skipped_count, unmatched_count = run_exiftool_geotag(
+                    exiftool_path,
+                    gpx_files,
+                    dest_dir,
+                    file_extensions,
+                    overwrite_existing,
+                    max_workers,
+                    camera_tz_offset,
+                )
+                result_parts = [f"{tagged_count}個に付与"]
                 if skipped_count > 0:
-                    self.log_message(f"ExifToolジオタギング完了: {tagged_count}個に付与、{skipped_count}個はスキップ（既にGPS情報あり）")
-                else:
-                    self.log_message(f"ExifToolジオタギング完了: {tagged_count}個に付与")
+                    result_parts.append(f"{skipped_count}個はスキップ（既にGPS情報あり）")
+                if unmatched_count > 0:
+                    result_parts.append(f"{unmatched_count}個は撮影時刻に一致する軌跡なし")
+                result_message = "ExifToolジオタギング完了: " + "、".join(result_parts)
+                self.log_message(
+                    result_message,
+                    "WARNING" if unmatched_count > 0 else "INFO",
+                )
             except FileNotFoundError:
                 msg = (
                     f"ExifTool が見つかりません。"
@@ -2838,9 +3276,13 @@ class ProcessingPopup(ctk.CTkToplevel):
             except subprocess.CalledProcessError as error:
                 msg = f"ExifTool の実行に失敗しました (終了コード {error.returncode})"
                 self.log_message(msg, "ERROR")
-                if error.stderr:
-                    self.log_message(error.stderr.strip(), "ERROR")
+                detail = (error.stderr or error.output or "").strip()
+                if detail:
+                    self.log_message(detail, "ERROR")
                 self.show_error_banner(msg)
+                self._last_write_issue = (dest_dir, error)
+                self.show_write_permission_button()
+                self.open_write_permission_dialog()
                 self.is_processing = False
                 self.after(0, lambda: self.close_button.configure(state="normal"))
                 return

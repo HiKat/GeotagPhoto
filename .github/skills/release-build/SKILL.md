@@ -8,6 +8,7 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
 ## 前提ルール
 - 開発は常に **dev** ブランチで行う。**main** ブランチは公開リリース済みの状態のみ保持する。
 - ビルド成果物・ZIP・一時ファイルはすべて `releases/v{X.Y.Z}/` に配置する（`dist_package/` は使用しない）。
+- 公開完了後、`releases/latest` を公開した最新版の `releases/v{X.Y.Z}` に対する**ディレクトリ・シンボリックリンク**として更新する。コピーやジャンクションで代用しない。
 - `releases/` ディレクトリは `.gitignore` に含まれており、リポジトリにはコミットしない。
 - SPEC.md はリリース前に最新状態に更新されていること（前提条件）。バージョンごとに機能を明示すること。
 
@@ -109,13 +110,15 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
    & "myenv\Scripts\python.exe" -c "import py_compile; py_compile.compile(r'main.py', doraise=True); print('OK')"
    ```
 4. **テスト実行**
-   - `test/` 配下のテストファイルをすべて実行する
+   - `test/`（ローカルテスト）と `tests/`（追跡対象の自動テスト）配下をすべて実行する
    ```powershell
-   & "myenv\Scripts\python.exe" -m pytest test/ -v
+   $testPaths = @("test", "tests") | Where-Object { Test-Path $_ }
+   & "myenv\Scripts\python.exe" -m pytest $testPaths -v
    ```
    - pytest が未インストールの場合は個別に実行:
    ```powershell
-   Get-ChildItem test\*.py | ForEach-Object { & "myenv\Scripts\python.exe" $_.FullName }
+   Get-ChildItem test\*.py, tests\*.py -ErrorAction SilentlyContinue |
+       ForEach-Object { & "myenv\Scripts\python.exe" $_.FullName }
    ```
 5. **エラーがあれば修正してからステップ3へ進む**
 
@@ -289,7 +292,40 @@ gh release create vX.Y.Z `
   --notes-file "releases\vX.Y.Z\release_notes.md"
 ```
 
-### 5.4 README.md のリリースリンク更新（dev ブランチで実施）
+### 5.4 `releases/latest` シンボリックリンクの更新
+
+GitHub リリースの作成が成功した後、ローカルの `releases/latest` を今回の公開版へ張り替える。
+既存の `latest` が通常のファイル／フォルダーだった場合は自動削除せず、エラーで停止してユーザーに確認する。
+
+```powershell
+$releaseRoot = (Resolve-Path "releases").Path
+$versionDir = (Resolve-Path "releases\vX.Y.Z").Path
+$latest = Join-Path $releaseRoot "latest"
+$existing = Get-Item -LiteralPath $latest -Force -ErrorAction SilentlyContinue
+
+if ($null -ne $existing) {
+    if ($existing.LinkType -ne "SymbolicLink") {
+        throw "releases/latest はシンボリックリンクではありません。内容を確認して手動で退避または削除してください: $latest"
+    }
+    Remove-Item -LiteralPath $latest -Force
+}
+
+New-Item -ItemType SymbolicLink -Path $latest -Target $versionDir | Out-Null
+
+# 作成種別とリンク先を必ず検証する
+$created = Get-Item -LiteralPath $latest -Force
+$createdTarget = [System.IO.Path]::GetFullPath(
+    [string]($created.Target | Select-Object -First 1)
+)
+if ($created.LinkType -ne "SymbolicLink" -or $createdTarget -ne $versionDir) {
+    throw "releases/latest の検証に失敗しました。LinkType=$($created.LinkType), Target=$createdTarget"
+}
+$created | Select-Object FullName, LinkType, Target
+```
+
+> `New-Item -ItemType SymbolicLink` が権限エラーになる場合は、Windows の「開発者モード」を有効にするか、管理者 PowerShell で同じ手順を実行する。リンク作成に失敗したまま公開完了扱いにしない。
+
+### 5.5 README.md のリリースリンク更新（dev ブランチで実施）
 
 #### 更新が必要な箇所（grep で一括確認する）
 
@@ -322,7 +358,7 @@ git push origin main
 git checkout dev
 ```
 
-### 5.5 ツイート案の作成
+### 5.6 ツイート案の作成
 
 リリース完了後、宣伝用のツイート案を作成してユーザーに提示する。
 
@@ -337,7 +373,7 @@ https://github.com/HiKat/GeotagPhoto/releases/tag/vX.Y.Z
 - 技術的な内部実装の詳細は省き、ユーザーにとっての価値・変更点を伝える
 - URLは必ずリリースページへのリンクを含める
 
-### 5.6 dev ブランチに戻る
+### 5.7 dev ブランチに戻る
 ```powershell
 git checkout dev
 ```
@@ -355,5 +391,6 @@ git checkout dev
 - [ ] main ブランチにマージ済み
 - [ ] タグが作成・プッシュ済み
 - [ ] GitHub リリースページにアセットとリリースノートがアップロード済み
+- [ ] `releases/latest` がディレクトリ・シンボリックリンクで、今回公開した `releases/vX.Y.Z` を指している
 - [ ] README.md のリリースリンクが最新バージョンに更新済み（dev→main マージ済み）
 - [ ] ツイート案を作成・提示済み
