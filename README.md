@@ -32,9 +32,9 @@ Automatically geotag your photos using Garmin Connect GPS logs.
 #### ダウンロード
 
 最新版は GitHub Releases からダウンロードできます。
-- **[GeotagPhoto v1.2.2（最新）](https://github.com/HiKat/GeotagPhoto/releases/tag/v1.2.2)**
+- **[GeotagPhoto v1.2.3（最新）](https://github.com/HiKat/GeotagPhoto/releases/tag/v1.2.3)**
 
-ZIP ファイル（`GeotagPhoto-v1.2.2-win64.zip`）をダウンロードしてください。
+ZIP ファイル（`GeotagPhoto-v1.2.3-win64.zip`）をダウンロードしてください。
 
 #### 前提条件
 

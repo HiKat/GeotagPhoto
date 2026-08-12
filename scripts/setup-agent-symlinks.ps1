@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess = $true)]
+﻿[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [switch]$Force
 )
@@ -88,31 +88,155 @@ function New-RepoSymbolicLink {
             throw "Target already exists and is not the expected symbolic link: $LinkPath. Re-run with -Force to replace it."
         }
 
-        if ($PSCmdlet.ShouldProcess($LinkPath, 'Replace existing item')) {
-            $isReparsePoint = (($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
-            if ($existing.PSIsContainer -and -not $isReparsePoint) {
-                throw "Refusing to remove an existing directory: $LinkPath. Remove or rename it manually, then re-run this script."
-            }
-
-            Remove-Item -LiteralPath $absoluteLink -Force
+        $isReparsePoint = (($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($existing.PSIsContainer -and -not $isReparsePoint) {
+            throw "Refusing to remove an existing directory: $LinkPath. Remove or rename it manually, then re-run this script."
         }
     }
 
-    if ($PSCmdlet.ShouldProcess($LinkPath, "Create symbolic link to $LinkTargetPath")) {
-        $linkName = Split-Path -Leaf $absoluteLink
-        Push-Location -LiteralPath $parent
+    $action = if ($null -eq $existing) {
+        "Create symbolic link to $LinkTargetPath"
+    }
+    else {
+        "Safely replace existing item with symbolic link to $LinkTargetPath"
+    }
+    if (-not $PSCmdlet.ShouldProcess($LinkPath, $action)) {
+        return
+    }
+
+    $transactionId = [Guid]::NewGuid().ToString('N')
+    $temporaryLink = Join-Path $parent ".__agent_link_new_$transactionId"
+    $backupPath = Join-Path $parent ".__agent_link_old_$transactionId"
+    $temporaryCreated = $false
+    $existingMoved = $false
+    $installed = $false
+    $existingWasDirectory = $null -ne $existing -and $existing.PSIsContainer
+
+    try {
+        # 権限不足でも既存項目を失わないよう、新リンクを先に作成・検証する。
         try {
+            Push-Location -LiteralPath $parent
             try {
-                New-Item -ItemType SymbolicLink -Path $linkName -Target $LinkTargetPath | Out-Null
+                New-Item `
+                    -ItemType SymbolicLink `
+                    -Path (Split-Path -Leaf $temporaryLink) `
+                    -Target $LinkTargetPath | Out-Null
             }
-            catch [System.UnauthorizedAccessException] {
-                throw "Unable to create symbolic links. Run PowerShell as Administrator or enable Windows Developer Mode, then re-run this script."
+            finally {
+                Pop-Location
             }
         }
-        finally {
-            Pop-Location
+        catch [System.UnauthorizedAccessException] {
+            throw "Unable to create symbolic links. Run PowerShell as Administrator or enable Windows Developer Mode, then re-run this script."
+        }
+        $temporaryCreated = $true
+        $temporaryItem = Get-Item -LiteralPath $temporaryLink -Force -ErrorAction Stop
+        if (-not (Test-ExpectedSymbolicLink -Item $temporaryItem -ExpectedTarget $LinkTargetPath -ExpectedSource $SourcePath)) {
+            throw "Created link did not resolve to the expected source: $LinkPath -> $LinkTargetPath"
+        }
+
+        if ($null -ne $existing) {
+            if ($existingWasDirectory) {
+                [System.IO.Directory]::Move($absoluteLink, $backupPath)
+            }
+            else {
+                [System.IO.File]::Move($absoluteLink, $backupPath)
+            }
+            $existingMoved = $true
+        }
+
+        if ($Kind -eq 'Directory') {
+            [System.IO.Directory]::Move($temporaryLink, $absoluteLink)
+        }
+        else {
+            [System.IO.File]::Move($temporaryLink, $absoluteLink)
+        }
+        $temporaryCreated = $false
+        $installed = $true
+
+        $installedItem = Get-Item -LiteralPath $absoluteLink -Force -ErrorAction Stop
+        if (-not (Test-ExpectedSymbolicLink -Item $installedItem -ExpectedTarget $LinkTargetPath -ExpectedSource $SourcePath)) {
+            throw "Installed link did not resolve to the expected source: $LinkPath -> $LinkTargetPath"
+        }
+
+        if ($existingMoved) {
+            if ($existingWasDirectory) {
+                [System.IO.Directory]::Delete($backupPath)
+            }
+            else {
+                [System.IO.File]::Delete($backupPath)
+            }
+            $existingMoved = $false
         }
         Write-Host "Linked: $LinkPath -> $LinkTargetPath"
+    }
+    catch {
+        $originalError = $_
+        $rollbackErrors = New-Object System.Collections.Generic.List[string]
+
+        if ($installed) {
+            try {
+                $installedItem = Get-Item -LiteralPath $absoluteLink -Force -ErrorAction Stop
+                if (-not (Test-ExpectedSymbolicLink -Item $installedItem -ExpectedTarget $LinkTargetPath -ExpectedSource $SourcePath)) {
+                    throw "Refusing to remove an unexpected replacement: $absoluteLink"
+                }
+                if ($Kind -eq 'Directory') {
+                    [System.IO.Directory]::Delete($absoluteLink)
+                }
+                else {
+                    [System.IO.File]::Delete($absoluteLink)
+                }
+                $installed = $false
+            }
+            catch {
+                $rollbackErrors.Add("Failed to remove the new link: $($_.Exception.Message)")
+            }
+        }
+
+        if ($existingMoved) {
+            try {
+                if (Test-Path -LiteralPath $absoluteLink) {
+                    throw "Cannot restore the original item because the destination exists: $absoluteLink"
+                }
+                if ($existingWasDirectory) {
+                    [System.IO.Directory]::Move($backupPath, $absoluteLink)
+                }
+                else {
+                    [System.IO.File]::Move($backupPath, $absoluteLink)
+                }
+                $existingMoved = $false
+            }
+            catch {
+                $rollbackErrors.Add("Failed to restore the original item: $($_.Exception.Message)")
+            }
+        }
+
+        if ($rollbackErrors.Count -gt 0) {
+            throw (
+                "Symbolic-link update failed: $($originalError.Exception.Message)`n" +
+                "Rollback also failed: $($rollbackErrors -join '; ')`n" +
+                "Recovery paths: $absoluteLink, $backupPath, $temporaryLink"
+            )
+        }
+        throw "Symbolic-link update failed; the original item was preserved or restored: $($originalError.Exception.Message)"
+    }
+    finally {
+        if ($temporaryCreated) {
+            try {
+                $temporaryItem = Get-Item -LiteralPath $temporaryLink -Force -ErrorAction SilentlyContinue
+                if ($null -ne $temporaryItem -and $temporaryItem.LinkType -eq 'SymbolicLink') {
+                    if ($Kind -eq 'Directory') {
+                        [System.IO.Directory]::Delete($temporaryLink)
+                    }
+                    else {
+                        [System.IO.File]::Delete($temporaryLink)
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Temporary link cleanup failed; inspect manually: $temporaryLink ($($_.Exception.Message))"
+            }
+        }
     }
 }
 

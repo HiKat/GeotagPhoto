@@ -1,6 +1,6 @@
 ---
 name: release-build
-description: ユーザーから「リリースしたい」「ビルドしたい」「新バージョンを公開したい」等のリリース作業を依頼された場合に読み込んでください。exe ビルド、ZIP 作成、GitHub リリース公開の全手順を含みます。
+description: GeotagPhoto のリリース候補作成、Windows exe/ZIP ビルド、ローカル releases/latest 更新、ユーザーレビュー、GitHub 公開、公開後検証を行う。ユーザーが「リリースしたい」「ビルドしたい」「新バージョンを公開したい」「latest を更新したい」と依頼した場合に使用する。
 ---
 
 # リリースビルド手順
@@ -8,9 +8,13 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
 ## 前提ルール
 - 開発は常に **dev** ブランチで行う。**main** ブランチは公開リリース済みの状態のみ保持する。
 - ビルド成果物・ZIP・一時ファイルはすべて `releases/v{X.Y.Z}/` に配置する（`dist_package/` は使用しない）。
-- 公開完了後、`releases/latest` を公開した最新版の `releases/v{X.Y.Z}` に対する**ディレクトリ・シンボリックリンク**として更新する。コピーやジャンクションで代用しない。
+- `releases/latest` は、**最新の機械検証済みローカル候補版**を指すディレクトリ・シンボリックリンクとする。GitHub で公開済みであることの証明には使わない。
+- 候補版の整合検証が完了した直後、ユーザーレビュー前に `releases/latest` を更新する。コピーやジャンクションで代用しない。
+- `releases/latest` の更新は同梱スクリプトだけで行う。既存リンクを先に削除する手順は禁止する。
 - `releases/` ディレクトリは `.gitignore` に含まれており、リポジトリにはコミットしない。
-- SPEC.md はリリース前に最新状態に更新されていること（前提条件）。バージョンごとに機能を明示すること。
+- `SPEC.md` は Git で追跡し、リリース前に最新状態へ更新する。バージョンごとに機能を明示する。
+- バージョンディレクトリや ZIP が既に存在する場合は上書きしない。内容を確認し、再作成にはユーザーの承認を得る。
+- Python、git、gh、Nuitka の終了コードが非ゼロなら即時停止する。失敗した工程を成功扱いしない。
 
 ---
 
@@ -29,13 +33,57 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
 3. **ユーザーにバージョン番号の確認を求める**
    - 確定したバージョンを `vX.Y.Z` 形式で記録する
 
+4. **確定バージョンを一度だけ変数へ設定する**
+   ```powershell
+   Set-StrictMode -Version Latest
+   $ErrorActionPreference = "Stop"
+
+   $version = "X.Y.Z"
+   $tag = "v$version"
+   $fileVersion = "$version.0"
+   $repository = "HiKat/GeotagPhoto"
+   $repoRoot = (Resolve-Path -LiteralPath ".").Path
+   $releaseRoot = Join-Path $repoRoot "releases"
+   if (-not (Test-Path -LiteralPath $releaseRoot)) {
+       New-Item -ItemType Directory -Path $releaseRoot | Out-Null
+   }
+   $releaseRootItem = Get-Item -LiteralPath $releaseRoot -Force
+   if (-not $releaseRootItem.PSIsContainer -or
+       ($releaseRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+       throw "releases はリポジトリ直下の実ディレクトリである必要があります: $releaseRoot"
+   }
+   $releaseDir = Join-Path $releaseRoot $tag
+   $distDir = Join-Path $releaseDir "GeotagPhoto"
+   $zipPath = Join-Path $releaseDir "GeotagPhoto-$tag-win64.zip"
+
+   if ($tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+       throw "バージョン形式が不正です: $tag"
+   }
+   ```
+   - 以後、`vX.Y.Z` の手置換やバージョンの再推測をしない。
+
 ---
 
 ## ステップ2: リリース前チェック（エージェント側で完結）
 
 ユーザーに手動テストを依頼する前に、以下のチェックをエージェント側で実施する。
 
-1. **認証情報・設定ファイルが含まれていないことを確認する**
+1. **ブランチ、作業ツリー、仮想環境を確認する**
+   ```powershell
+   $currentBranch = git branch --show-current
+   if ($LASTEXITCODE -ne 0) { throw "現在ブランチを取得できません。" }
+   if ($currentBranch -cne "dev") { throw "dev ブランチで実行してください。現在: $currentBranch" }
+
+   $worktreeStatus = git status --porcelain
+   if ($LASTEXITCODE -ne 0) { throw "作業ツリーの状態を取得できません。" }
+   if ($worktreeStatus) { throw "未コミット変更があります。先に内容を確定してください。" }
+
+   & "myenv\Scripts\python.exe" --version
+   if ($LASTEXITCODE -ne 0) { throw "仮想環境 myenv が利用できません。リリースを停止します。" }
+   ```
+   - 仮想環境が壊れている場合、無断で Python のインストールや環境再作成を行わない。状態を報告し、復旧後に再開する。
+
+2. **認証情報・設定ファイルが含まれていないことを確認する**
 
    以下の Python スクリプトを一時ファイル `check_creds.py` として実行し、完了後に削除する。
 
@@ -75,7 +123,9 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
    result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True)
    tracked = result.stdout.splitlines()
 
-   git_ok = True
+   git_ok = result.returncode == 0
+   if not git_ok:
+       print(f'[git ls-files] failed: {result.stderr.strip()}')
    for f in tracked:
        fl = f.replace('\\', '/').lower()
        # test/ 配下が追跡されていないか確認
@@ -91,36 +141,50 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
 
    if git_ok:
        print('[git ls-files] No dangerous files tracked (OK)')
+
+   if not code_ok or not git_ok:
+       raise SystemExit(1)
    ```
 
    ```powershell
    & "myenv\Scripts\python.exe" check_creds.py
+   $credentialExitCode = $LASTEXITCODE
    Remove-Item check_creds.py
+   if ($credentialExitCode -ne 0) { throw "認証情報チェックに失敗しました。" }
    ```
 
    - 両方の出力が `(OK)` であればチェック通過
    - `[HARDCODED/...]` が出た場合: `main.py` の該当箇所を修正してから先へ進む
    - `[GIT/...]` が出た場合: `.gitignore` に追加して `git rm --cached <ファイル>` で追跡解除してから先へ進む
 
-2. **SPEC.md の確認**
-   - バージョン付きで最新状態に更新されているか確認する
-   - 未更新の場合はリリース前に更新を完了させる
-3. **構文チェック**
+3. **README.md と SPEC.md をビルド前に更新する**
+   - `README.md` の「最新」ダウンロード表記、リリース URL、ZIP 名を `$tag` に更新する。過去版の例示は変更しない。
+   - `SPEC.md` の現在仕様、変更内容、ビルド方針、リリース前チェック、リリース履歴を `$tag` で更新する。
+   - `SPEC.md` が追跡対象であることを確認する。
+   ```powershell
+   git ls-files --error-unmatch SPEC.md
+   if ($LASTEXITCODE -ne 0) { throw "SPEC.md が Git の追跡対象ではありません。" }
+
+   Select-String -Path README.md -Pattern "最新|releases/tag/|GeotagPhoto-v[0-9]+\.[0-9]+\.[0-9]+-win64.zip"
+   Select-String -Path SPEC.md -Pattern ([regex]::Escape("[$tag]"))
+   ```
+   - README/SPEC の変更を dev のリリース対象コミットへ含めてから、クリーンな作業ツリーで次へ進む。タグ作成後に README だけを追加コミットしない。
+
+4. **構文チェック**
    ```powershell
    & "myenv\Scripts\python.exe" -c "import py_compile; py_compile.compile(r'main.py', doraise=True); print('OK')"
+   if ($LASTEXITCODE -ne 0) { throw "main.py の構文チェックに失敗しました。" }
    ```
-4. **テスト実行**
+5. **テスト実行**
    - `test/`（ローカルテスト）と `tests/`（追跡対象の自動テスト）配下をすべて実行する
    ```powershell
    $testPaths = @("test", "tests") | Where-Object { Test-Path $_ }
+   if (@($testPaths).Count -eq 0) { throw "テストディレクトリがありません。" }
    & "myenv\Scripts\python.exe" -m pytest $testPaths -v
+   if ($LASTEXITCODE -ne 0) { throw "pytest に失敗しました。" }
    ```
-   - pytest が未インストールの場合は個別に実行:
-   ```powershell
-   Get-ChildItem test\*.py, tests\*.py -ErrorAction SilentlyContinue |
-       ForEach-Object { & "myenv\Scripts\python.exe" $_.FullName }
-   ```
-5. **エラーがあれば修正してからステップ3へ進む**
+   - pytest が未インストール、またはテストを収集できない場合も停止する。pytest 形式のファイルを直接実行して代用しない。
+6. **エラーがあれば修正してからステップ3へ進む**
 
 ---
 
@@ -128,12 +192,15 @@ description: ユーザーから「リリースしたい」「ビルドしたい�
 
 ### 3.1 ディレクトリ作成
 ```powershell
-New-Item -ItemType Directory -Path "releases\vX.Y.Z" -Force
+if (Test-Path -LiteralPath $releaseDir) {
+    throw "候補版ディレクトリが既に存在します。自動上書きしません: $releaseDir"
+}
+New-Item -ItemType Directory -Path $releaseDir | Out-Null
 ```
 
 ### 3.2 Nuitka ビルド実行
 
-以下のテンプレートを使用する。`X.Y.Z` 部分を確定バージョンに置換する。
+ステップ1で確定した変数を使用し、バージョン文字列を手置換しない。
 
 ```powershell
 & "myenv\Scripts\python.exe" -m nuitka --standalone --enable-plugin=tk-inter `
@@ -145,15 +212,16 @@ New-Item -ItemType Directory -Path "releases\vX.Y.Z" -Force
   --include-data-dir=myenv/Lib/site-packages/customtkinter=customtkinter `
   --windows-console-mode=disable `
   --output-filename=GeotagPhoto.exe `
-  --output-dir="releases\vX.Y.Z" `
+  --output-dir="$releaseDir" `
   --assume-yes-for-downloads `
   --windows-company-name="GeotagPhoto Project" `
   --windows-product-name="GeotagPhoto" `
-  --windows-file-version="X.Y.Z.0" `
-  --windows-product-version="X.Y.Z.0" `
+  --windows-file-version="$fileVersion" `
+  --windows-product-version="$fileVersion" `
   --windows-file-description="Photo geotagging tool using Garmin Connect GPX" `
   --windows-icon-from-ico=static/logo/app.ico `
   main.py
+if ($LASTEXITCODE -ne 0) { throw "Nuitka ビルドに失敗しました。" }
 ```
 
 > **`--msvc=latest` について（必須）**:
@@ -175,22 +243,34 @@ New-Item -ItemType Directory -Path "releases\vX.Y.Z" -Force
 ### 3.3 ビルド成果物のコピー
 
 ```powershell
-# releases/vX.Y.Z/main.dist/ を releases/vX.Y.Z/GeotagPhoto/ にリネームコピー
-Copy-Item -Recurse "releases\vX.Y.Z\main.dist" "releases\vX.Y.Z\GeotagPhoto"
+# main.dist/ を候補版の GeotagPhoto/ にコピー
+Copy-Item -Recurse (Join-Path $releaseDir "main.dist") $distDir
 
 # ライセンスファイルをコピー
-Copy-Item COPYING "releases\vX.Y.Z\GeotagPhoto\"
-Copy-Item NOTICE.md "releases\vX.Y.Z\GeotagPhoto\"
-Copy-Item THIRD_PARTY_NOTICES.md "releases\vX.Y.Z\GeotagPhoto\"
-if (Test-Path third_party_licenses) {
-    Copy-Item -Recurse third_party_licenses "releases\vX.Y.Z\GeotagPhoto\"
+Copy-Item COPYING $distDir
+Copy-Item NOTICE.md $distDir
+Copy-Item THIRD_PARTY_NOTICES.md $distDir
+Copy-Item README.md (Join-Path $distDir "README.txt")
+if (-not (Test-Path -LiteralPath third_party_licenses -PathType Container)) {
+    throw "third_party_licenses がありません。"
 }
+Copy-Item -Recurse third_party_licenses $distDir
 ```
+
+> `README.txt` は root の `README.md` から必ず生成する。候補版フォルダー内だけを手編集しない。
 
 ### 3.4 ビルド中間物のクリーンアップ
 
 ```powershell
-Remove-Item -Recurse -Force "releases\vX.Y.Z\main.build", "releases\vX.Y.Z\main.dist"
+$buildDir = Join-Path $releaseDir "main.build"
+$nuitkaDistDir = Join-Path $releaseDir "main.dist"
+foreach ($path in @($buildDir, $nuitkaDistDir)) {
+    $resolved = (Resolve-Path -LiteralPath $path -ErrorAction Stop).Path
+    if (-not $resolved.StartsWith($releaseDir + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "クリーンアップ対象が候補版ディレクトリ外です: $resolved"
+    }
+}
+Remove-Item -Recurse -Force -LiteralPath $buildDir, $nuitkaDistDir
 ```
 
 > `--output-dir` により中間物は `releases/vX.Y.Z/` 内に生成されるため、コピー後に削除する。
@@ -198,14 +278,15 @@ Remove-Item -Recurse -Force "releases\vX.Y.Z\main.build", "releases\vX.Y.Z\main.
 ### 3.5 ZIP 作成
 
 ```powershell
-Compress-Archive -Path "releases\vX.Y.Z\GeotagPhoto" -DestinationPath "releases\vX.Y.Z\GeotagPhoto-vX.Y.Z-win64.zip"
+if (Test-Path -LiteralPath $zipPath) { throw "ZIP が既に存在します: $zipPath" }
+Compress-Archive -Path $distDir -DestinationPath $zipPath
 ```
 
-命名規則: `GeotagPhoto-vX.Y.Z-win64.zip`（固定）
+命名規則: `GeotagPhoto-$tag-win64.zip`（例: `GeotagPhoto-v1.2.4-win64.zip`）
 
 ### 3.6 リリースノート作成
 
-`releases/vX.Y.Z/release_notes.md` を以下のフォーマットで作成する。
+`$releaseDir/release_notes.md` を以下のフォーマットで作成する。
 
 ```markdown
 ## 変更内容 (vA.B.C → vX.Y.Z)
@@ -226,34 +307,66 @@ Compress-Archive -Path "releases\vX.Y.Z\GeotagPhoto" -DestinationPath "releases\
 - セクションに該当する変更がない場合、そのセクションは省略する
 - 前回リリースからの全変更をまとめて記載する
 
+### 3.7 候補版の機械検証と `releases/latest` 更新
+
+リリースノート作成後、同梱スクリプトを実行する。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".github\skills\release-build\scripts\Update-LatestRelease.ps1" `
+  -Version $tag `
+  -Phase Candidate
+if ($LASTEXITCODE -ne 0) { throw "候補版の整合検証または latest 更新に失敗しました。" }
+```
+
+このスクリプトは次をすべて確認してから `latest` を更新する。
+
+- 配布フォルダー、ZIP、リリースノート、README、ライセンス、必須アイコンの存在
+- EXE の FileVersion / ProductVersion が `$fileVersion` と一致
+- 配布フォルダーと ZIP の全ファイルについて、相対パス・サイズ・SHA-256 が完全一致
+- ZIP に絶対パス、親参照、ADS、重複、大小文字衝突、シンボリックリンクがない
+- `SPEC.md`、同梱 `README.txt`、リリースノートのバージョン表記が `$tag` と一致
+- `latest` がディレクトリ・シンボリックリンクで、候補版を指し、EXE ハッシュも一致
+
+検証開始前から `releases` 内の排他ロックを保持する。Candidate では旧版への逆行を拒否し、新しい一時リンクを先に作成・検証してから旧リンクを退避・切替する。権限不足や検証失敗時は旧リンクを保持または復元する。通常ファイル、通常フォルダー、ジャンクション、前回失敗時の退避リンクがある場合は自動変更しない。
+
+> Windows PowerShell 5.1 の既定実行ポリシーでも、リポジトリ内の検証済みスクリプトを実行できるよう、この呼び出しに限り `-ExecutionPolicy Bypass` を指定する。ダウンロードした任意スクリプトには使用しない。
+
 ---
 
 ## ステップ4: ユーザーレビュー（一括）
 
-ビルド・パッケージング完了後、以下の **3項目をまとめて** ユーザーに提示し、一度のレビューで承認を得る。
+ビルド・パッケージング完了後、以下の **4項目をまとめて** ユーザーに提示し、一度のレビューで承認を得る。
 
 ### 4.1 レビュー準備（エージェント側で実施）
 
 1. **リリースノートの作成**: ステップ3.6 で `releases/vX.Y.Z/release_notes.md` を作成済みであること
 2. **dev → main のマージ検証**: マージ前に以下を確認する
    ```powershell
-   # マージのドライラン（実際にはマージしない）
-   git checkout main
-   git merge --no-commit --no-ff dev
-   git diff --stat HEAD   # 変更ファイル一覧を確認
-   git merge --abort       # ドライランを中止
-   git checkout dev
+   # 作業ツリーを変更せず、マージ結果の tree を計算する
+   $mergeTree = git merge-tree --write-tree main dev
+   if ($LASTEXITCODE -ne 0) { throw "dev から main へのマージ競合があります。" }
+
+   $mergeDiff = git diff --stat main...dev
+   if ($LASTEXITCODE -ne 0) { throw "main と dev の差分を取得できません。" }
+   $mergeTree
+   $mergeDiff
    ```
    - コンフリクトの有無、変更ファイル一覧を記録する
    - コンフリクトがある場合は解決方針をまとめる
 
 ### 4.2 ユーザーへのレビュー依頼
 
-以下の3項目を **1つのメッセージで** ユーザーに提示する:
+以下の4項目を **1つのメッセージで** ユーザーに提示する:
 
-1. **EXE 動作確認**: `releases/vX.Y.Z/GeotagPhoto/GeotagPhoto.exe` の動作確認を依頼
+1. **EXE 動作確認**: `$distDir/GeotagPhoto.exe` の動作確認を依頼
 2. **リリースノートレビュー**: `releases/vX.Y.Z/release_notes.md` の内容を提示
 3. **マージ検証結果**: コンフリクトの有無、変更ファイル一覧を報告。問題がある場合は詳細を提示
+4. **候補版の同一性**: `releases/latest` のリンク先、EXE バージョン、配布ファイル数、EXE/ZIP の SHA-256、`LatestUpdated` を提示
+
+- レビュー対象は必ず `$tag` のバージョン付きパスと `releases/latest` の両方を明示する。
+- 両経路の EXE ハッシュが一致しなければ、レビューを依頼せずステップ3.7へ戻る。
+- この時点の `latest` は検証済みローカル候補版であり、GitHub 公開済みとは限らないことを明記する。
 
 ### 4.3 レビュー結果の反映
 
@@ -266,17 +379,40 @@ Compress-Archive -Path "releases\vX.Y.Z\GeotagPhoto" -DestinationPath "releases\
 
 ユーザーからレビュー OK が出たら、以下を一括で実施する。
 
+### 公開中の失敗ルール
+
+- リモートへの push 前に失敗した場合は、GitHub Release、公開完了報告へ進まない。
+- main／タグの push または GitHub Release 作成後に失敗した場合は「部分公開」と報告し、成功済み工程と失敗工程を列挙する。
+- 公開済みタグの削除・付け替え、GitHub Release の削除、バージョンディレクトリの削除を自動実行しない。同じ `$tag` で安全に再開する。
+- `releases/latest` の更新・再検証に失敗しても、公開済み成果物を巻き戻さない。リンクの元状態と復旧用パスを報告し、公開完了とは扱わない。
+
 ### 5.1 main ブランチへのマージ
 ```powershell
 git checkout main
+if ($LASTEXITCODE -ne 0) { throw "main へ切り替えられません。" }
 git merge dev
-git push origin main
+if ($LASTEXITCODE -ne 0) { throw "dev を main へマージできません。" }
 ```
 
 ### 5.2 タグの作成とプッシュ
 ```powershell
-git tag vX.Y.Z
-git push origin vX.Y.Z
+$mainCommit = (git rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw "main のコミットを取得できません。" }
+
+$tagCommit = git rev-parse --verify "refs/tags/$tag^{commit}" 2>$null
+if ($LASTEXITCODE -eq 0) {
+    if ($tagCommit.Trim() -cne $mainCommit) {
+        throw "既存タグ $tag は現在の main と異なるコミットです。自動で付け替えません。"
+    }
+}
+else {
+    git tag $tag
+    if ($LASTEXITCODE -ne 0) { throw "ローカルタグを作成できません。" }
+}
+
+# main とタグを一括 push し、片方だけ公開される状態を避ける
+git push --atomic origin main $tag
+if ($LASTEXITCODE -ne 0) { throw "main とタグの atomic push に失敗しました。リモート状態を確認してください。" }
 ```
 
 ### 5.3 GitHub リリースの作成
@@ -284,81 +420,42 @@ git push origin vX.Y.Z
 # GitHub CLI の PATH 追加（必要に応じて）
 $env:PATH += ";C:\Program Files\GitHub CLI"
 
-# リリース作成（リリースノートを転記し、ZIP をアセットとして添付）
-gh release create vX.Y.Z `
-  "releases\vX.Y.Z\GeotagPhoto-vX.Y.Z-win64.zip" `
-  --repo HiKat/GeotagPhoto `
-  --title "vX.Y.Z" `
-  --notes-file "releases\vX.Y.Z\release_notes.md"
-```
-
-### 5.4 `releases/latest` シンボリックリンクの更新
-
-GitHub リリースの作成が成功した後、ローカルの `releases/latest` を今回の公開版へ張り替える。
-既存の `latest` が通常のファイル／フォルダーだった場合は自動削除せず、エラーで停止してユーザーに確認する。
-
-```powershell
-$releaseRoot = (Resolve-Path "releases").Path
-$versionDir = (Resolve-Path "releases\vX.Y.Z").Path
-$latest = Join-Path $releaseRoot "latest"
-$existing = Get-Item -LiteralPath $latest -Force -ErrorAction SilentlyContinue
-
-if ($null -ne $existing) {
-    if ($existing.LinkType -ne "SymbolicLink") {
-        throw "releases/latest はシンボリックリンクではありません。内容を確認して手動で退避または削除してください: $latest"
-    }
-    Remove-Item -LiteralPath $latest -Force
+# 既存 Release は上書きせず、後続の Published 検証へ送る。
+$releaseLookup = gh api --include "repos/$repository/releases/tags/$tag" 2>&1
+$releaseLookupExit = $LASTEXITCODE
+$releaseLookupText = ($releaseLookup | Out-String)
+if ($releaseLookupExit -eq 0) {
+    Write-Host "GitHub Release は既に存在します。内容検証へ進みます: $tag"
 }
-
-New-Item -ItemType SymbolicLink -Path $latest -Target $versionDir | Out-Null
-
-# 作成種別とリンク先を必ず検証する
-$created = Get-Item -LiteralPath $latest -Force
-$createdTarget = [System.IO.Path]::GetFullPath(
-    [string]($created.Target | Select-Object -First 1)
-)
-if ($created.LinkType -ne "SymbolicLink" -or $createdTarget -ne $versionDir) {
-    throw "releases/latest の検証に失敗しました。LinkType=$($created.LinkType), Target=$createdTarget"
+elseif ($releaseLookupText -match 'HTTP/\S+\s+404') {
+    gh release create $tag `
+      $zipPath `
+      --repo $repository `
+      --title $tag `
+      --notes-file (Join-Path $releaseDir "release_notes.md")
+    if ($LASTEXITCODE -ne 0) { throw "GitHub Release の作成に失敗しました。部分公開状態を確認してください。" }
 }
-$created | Select-Object FullName, LinkType, Target
+else {
+    throw "GitHub Release の有無を確認できません。作成を試みず停止します: $releaseLookupText"
+}
 ```
 
-> `New-Item -ItemType SymbolicLink` が権限エラーになる場合は、Windows の「開発者モード」を有効にするか、管理者 PowerShell で同じ手順を実行する。リンク作成に失敗したまま公開完了扱いにしない。
+### 5.4 公開状態と `releases/latest` の最終検証
 
-### 5.5 README.md のリリースリンク更新（dev ブランチで実施）
-
-#### 更新が必要な箇所（grep で一括確認する）
+候補版で更新済みの `latest`、Git の公開状態、GitHub Release を同梱スクリプトで一括検証する。
 
 ```powershell
-# README.md 内の旧バージョン参照を検索
-Select-String -Path README.md -Pattern "v[0-9]+\.[0-9]+\.[0-9]+" | Format-Table LineNumber, Line
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".github\skills\release-build\scripts\Update-LatestRelease.ps1" `
+  -Version $tag `
+  -Phase Published `
+  -Repository $repository
+if ($LASTEXITCODE -ne 0) { throw "公開後の整合検証に失敗しました。" }
 ```
 
-以下の箇所をすべて確認・更新する:
+`Published` は `latest` を変更しない読み取り専用ゲートである。Candidate の全検証に加え、タグ内 README/SPEC、ローカル・リモートの main/タグ、GitHub Release の公開状態・本文、ダウンロードした ZIP の SHA-256 まで確認する。このコマンドが成功するまでリリース完了と報告しない。
 
-| 箇所 | 内容 | 例 |
-|---|---|---|
-| ダウンロードリンクテキスト | `GeotagPhoto vA.B.C（最新）` | → `GeotagPhoto vX.Y.Z（最新）` |
-| リリースページURL | `releases/tag/vA.B.C` | → `releases/tag/vX.Y.Z` |
-| ZIP ファイル名 | `GeotagPhoto-vA.B.C-win64.zip` | → `GeotagPhoto-vX.Y.Z-win64.zip` |
-
-> **注意**: `v1.0.0` のような過去バージョンを「例示」として記載している箇所（GPLv3「対応ソース」セクション等）は更新不要。「最新」「ダウンロード」文脈にある箇所のみ更新する。
-
-#### コミット・プッシュ
-
-```powershell
-git add README.md
-git commit -m "README.md: 最新リリースリンクを vX.Y.Z に更新"
-git push origin dev
-
-# main にマージ
-git checkout main
-git merge dev
-git push origin main
-git checkout dev
-```
-
-### 5.6 ツイート案の作成
+### 5.5 ツイート案の作成
 
 リリース完了後、宣伝用のツイート案を作成してユーザーに提示する。
 
@@ -373,24 +470,26 @@ https://github.com/HiKat/GeotagPhoto/releases/tag/vX.Y.Z
 - 技術的な内部実装の詳細は省き、ユーザーにとっての価値・変更点を伝える
 - URLは必ずリリースページへのリンクを含める
 
-### 5.7 dev ブランチに戻る
+### 5.6 dev ブランチに戻る
 ```powershell
 git checkout dev
+if ($LASTEXITCODE -ne 0) { throw "dev へ戻せません。リリース自体の公開状態を維持したまま作業ツリーを確認してください。" }
 ```
 
 ---
 
 ## チェックリスト（リリース完了前の最終確認）
 
-- [ ] SPEC.md がバージョン付きで最新状態
+- [ ] SPEC.md が Git で追跡され、バージョン付きで最新状態
 - [ ] 構文チェック・テストが全てパス
-- [ ] EXE の Windows プロパティバージョンが正しい
-- [ ] ライセンスファイル（COPYING, NOTICE.md, THIRD_PARTY_NOTICES.md, third_party_licenses/）が ZIP に同梱
+- [ ] Candidate 検証が成功し、EXE の FileVersion / ProductVersion と配布フォルダー・ZIP の全ファイル SHA-256 が一致
+- [ ] README.txt とライセンスファイル（COPYING, NOTICE.md, THIRD_PARTY_NOTICES.md, third_party_licenses/）が ZIP に同梱
 - [ ] リリースノートが `releases/vX.Y.Z/release_notes.md` に作成済み
+- [ ] `releases/latest` が今回の検証済みローカル候補版を指し、候補版と同じ EXE ハッシュ
 - [ ] ユーザーによる動作確認が完了
 - [ ] main ブランチにマージ済み
-- [ ] タグが作成・プッシュ済み
-- [ ] GitHub リリースページにアセットとリリースノートがアップロード済み
-- [ ] `releases/latest` がディレクトリ・シンボリックリンクで、今回公開した `releases/vX.Y.Z` を指している
-- [ ] README.md のリリースリンクが最新バージョンに更新済み（dev→main マージ済み）
+- [ ] main、origin/main、タグが同じコミット
+- [ ] GitHub リリースが draft/prerelease ではなく、期待する ZIP アセットとリリースノートを公開済み
+- [ ] Published 検証が成功
+- [ ] README.md のリリースリンクがタグ対象コミット内で最新バージョンに更新済み
 - [ ] ツイート案を作成・提示済み

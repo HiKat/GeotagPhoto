@@ -40,7 +40,6 @@ config.json
 # 配布物はリポジトリから除外
 exiftool.exe
 *.log
-SPEC.md
 # テスト配下は全て追跡対象外（クレデンシャル含む可能性あり）
 test/
 

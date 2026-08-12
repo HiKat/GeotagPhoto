@@ -1,1 +1,1 @@
-C:/Users/hisa4/Desktop/GeotagPhoto/.github/copilot-instructions.md
+.github/copilot-instructions.md
