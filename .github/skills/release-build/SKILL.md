@@ -85,77 +85,28 @@ description: GeotagPhoto のリリース候補作成、Windows exe/ZIP ビルド
 
 2. **認証情報・設定ファイルが含まれていないことを確認する**
 
-   以下の Python スクリプトを一時ファイル `check_creds.py` として実行し、完了後に削除する。
-
-   ```python
-   import re, subprocess
-
-   # --- 1. main.py のハードコード検出 ---
-   with open('main.py', encoding='utf-8-sig') as f:
-       lines = f.readlines()
-
-   code_ok = True
-   email_pat = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-   pw_pat = re.compile(r'password\s*=\s*["\'][^"\']{3,}')
-   api_pat = re.compile(r'(?i)(api_key|apikey|client_secret|access_token|auth_token)\s*=\s*["\'][^"\']+')
-
-   skip = ['email_entry', 'email_frame', 'password_entry', 'pw_frame', 'erraticradar', 'show=', 'Email:', 'Password:']
-
-   for i, line in enumerate(lines, 1):
-       if any(s in line for s in skip):
-           continue
-       stripped = line.strip()
-       if stripped.startswith('#'):
-           continue
-       for pat, label in [(email_pat, 'EMAIL'), (pw_pat, 'PASSWORD'), (api_pat, 'API_KEY')]:
-           m = pat.search(line)
-           if m:
-               print(f'[HARDCODED/{label}] main.py line {i}: {stripped}')
-               code_ok = False
-
-   if code_ok:
-       print('[main.py] No hardcoded credentials (OK)')
-
-   # --- 2. git 追跡ファイルに認証情報・設定ファイルが含まれていないかチェック ---
-   # config.json / garmin_tokens / .token / .env / credentials 等が追跡されていると
-   # push 時にクレデンシャルが漏洩するリスクがある
-   DANGER_PATTERNS = ['config.json', 'garmin_tokens', '.token', 'credentials', '.env', 'auth_token']
-   result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True)
-   tracked = result.stdout.splitlines()
-
-   git_ok = result.returncode == 0
-   if not git_ok:
-       print(f'[git ls-files] failed: {result.stderr.strip()}')
-   for f in tracked:
-       fl = f.replace('\\', '/').lower()
-       # test/ 配下が追跡されていないか確認
-       if fl.startswith('test/'):
-           print(f'[GIT/test/ TRACKED] {f}  ← .gitignore に追加して git rm --cached で追跡解除してください')
-           git_ok = False
-           continue
-       for pat in DANGER_PATTERNS:
-           if pat.lower() in fl:
-               print(f'[GIT/CREDENTIAL FILE TRACKED] {f}  ← .gitignore に追加して git rm --cached で追跡解除してください')
-               git_ok = False
-               break
-
-   if git_ok:
-       print('[git ls-files] No dangerous files tracked (OK)')
-
-   if not code_ok or not git_ok:
-       raise SystemExit(1)
-   ```
+   同梱スキャナーで、現在のGit追跡ファイルと前回公開タグから現在の
+   `dev` までの各コミット時点を検査する。
 
    ```powershell
-   & "myenv\Scripts\python.exe" check_creds.py
-   $credentialExitCode = $LASTEXITCODE
-   Remove-Item check_creds.py
-   if ($credentialExitCode -ne 0) { throw "認証情報チェックに失敗しました。" }
+   & "myenv\Scripts\python.exe" `
+     ".github\skills\release-build\scripts\Test-CredentialExposure.py" `
+     --repository-root . `
+     --target-ref dev
+   if ($LASTEXITCODE -ne 0) { throw "認証情報チェックに失敗しました。" }
    ```
 
-   - 両方の出力が `(OK)` であればチェック通過
-   - `[HARDCODED/...]` が出た場合: `main.py` の該当箇所を修正してから先へ進む
-   - `[GIT/...]` が出た場合: `.gitignore` に追加して `git rm --cached <ファイル>` で追跡解除してから先へ進む
+   スキャナーは次を検査する。
+
+   - `main.py` のハードコードされたメール、パスワード、APIキー／トークン
+   - Git追跡対象の `.env`、`config.json`、`garmin_tokens`、`credentials`、`.token` 等
+   - 前回公開タグから現在までの各コミットに、一時的に追加後削除された認証情報がないこと
+   - 秘密鍵、AWS／GitHub／Google／Slack／Stripeの高確度トークン形式
+   - 検出値そのものは標準出力へ表示せず、種類とファイル位置だけを報告する
+
+   `credential-exposure-check: PASS` と `secret-values-printed: no` の両方が
+   出力されることを確認する。候補を検出した場合は、値をログへ出さずに
+   誤検知か実クレデンシャルかを確認し、解消するまでリリースを停止する。
 
 3. **README.md と SPEC.md をビルド前に更新する**
    - `README.md` の「最新」ダウンロード表記、リリース URL、ZIP 名を `$tag` に更新する。過去版の例示は変更しない。
@@ -317,6 +268,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Version $tag `
   -Phase Candidate
 if ($LASTEXITCODE -ne 0) { throw "候補版の整合検証または latest 更新に失敗しました。" }
+
+& "myenv\Scripts\python.exe" `
+  ".github\skills\release-build\scripts\Test-CredentialExposure.py" `
+  --repository-root . `
+  --target-ref dev `
+  --release-dir $releaseDir `
+  --zip-path $zipPath
+if ($LASTEXITCODE -ne 0) { throw "候補版の認証情報チェックに失敗しました。" }
 ```
 
 このスクリプトは次をすべて確認してから `latest` を更新する。
@@ -327,6 +286,7 @@ if ($LASTEXITCODE -ne 0) { throw "候補版の整合検証または latest 更�
 - ZIP に絶対パス、親参照、ADS、重複、大小文字衝突、シンボリックリンクがない
 - `SPEC.md`、同梱 `README.txt`、リリースノートのバージョン表記が `$tag` と一致
 - `latest` がディレクトリ・シンボリックリンクで、候補版を指し、EXE ハッシュも一致
+- 配布フォルダーとZIP内の危険な設定ファイル名、高確度トークン、秘密鍵が検出されない
 
 検証開始前から `releases` 内の排他ロックを保持する。Candidate では旧版への逆行を拒否し、新しい一時リンクを先に作成・検証してから旧リンクを退避・切替する。権限不足や検証失敗時は旧リンクを保持または復元する。通常ファイル、通常フォルダー、ジャンクション、前回失敗時の退避リンクがある場合は自動変更しない。
 
@@ -482,6 +442,7 @@ if ($LASTEXITCODE -ne 0) { throw "dev へ戻せません。リリース自体の
 
 - [ ] SPEC.md が Git で追跡され、バージョン付きで最新状態
 - [ ] 構文チェック・テストが全てパス
+- [ ] Git追跡内容・リリース差分履歴・配布フォルダー・ZIPの認証情報チェックがパス
 - [ ] Candidate 検証が成功し、EXE の FileVersion / ProductVersion と配布フォルダー・ZIP の全ファイル SHA-256 が一致
 - [ ] README.txt とライセンスファイル（COPYING, NOTICE.md, THIRD_PARTY_NOTICES.md, third_party_licenses/）が ZIP に同梱
 - [ ] リリースノートが `releases/vX.Y.Z/release_notes.md` に作成済み
